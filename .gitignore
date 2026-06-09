@@ -1,0 +1,30 @@
+# JavaScript
+node_modules/
+web-dist/
+
+# Rust and Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# Generated distributions
+dist/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+fastpas-config.json
+*.token
+*.secret
+
+# Local diagnostics and backups
+src-tauri/src/bin/fastpas_probe.rs
+*.bak
+*.bak-*
+*.log
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
