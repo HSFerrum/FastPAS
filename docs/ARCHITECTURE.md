@@ -56,6 +56,11 @@ Tauri commands form the boundary between the frontend and backend.
 Non-secret profile and tenant configuration is written under the Tauri
 application configuration directory for `com.fastpas.client`.
 
+The Windows portable package instead writes configuration to `FastPASData`
+beside `FastPAS.exe` and uses separate OS credential-manager service names.
+This prevents a newly extracted portable copy from loading profiles, tenants,
+or passcodes created by another FastPAS installation.
+
 Secrets are stored with the platform credential manager:
 
 - Windows Credential Manager

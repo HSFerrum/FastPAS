@@ -2,6 +2,7 @@
 setlocal
 
 set "APP_DIR=%~dp0"
+set "FASTPAS_PORTABLE=1"
 set "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER=%APP_DIR%WebView2Runtime"
 
 if not exist "%APP_DIR%FastPAS.exe" (

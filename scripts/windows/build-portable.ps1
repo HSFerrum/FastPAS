@@ -72,6 +72,8 @@ Run:
 Notes:
 - Do not remove or rename the WebView2Runtime folder.
 - Run-FastPAS.bat sets WEBVIEW2_BROWSER_EXECUTABLE_FOLDER to the local runtime.
+- Portable profiles and tenants are stored in the FastPASData folder created beside FastPAS.exe.
+- Existing FastPAS data from the Windows user profile is not loaded.
 "@
 
 Set-Content -LiteralPath (Join-Path $portableRoot "README-portable.txt") -Value $portableReadme -Encoding UTF8

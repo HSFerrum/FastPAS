@@ -1993,11 +1993,42 @@ fn save_config(app: &tauri::AppHandle, config: &StoredConfig) -> Result<()> {
 }
 
 fn config_path(app: &tauri::AppHandle) -> Result<PathBuf> {
+    if is_portable_mode() {
+        let executable = std::env::current_exe().context("failed to resolve FastPAS executable")?;
+        let app_dir = executable
+            .parent()
+            .context("failed to resolve FastPAS executable directory")?;
+        return Ok(app_dir.join("FastPASData").join("fastpas-config.json"));
+    }
+
     let base = app
         .path()
         .app_config_dir()
         .context("failed to resolve app config directory")?;
     Ok(base.join("fastpas-config.json"))
+}
+
+fn is_portable_mode() -> bool {
+    if std::env::var("FASTPAS_PORTABLE")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from))
+        .map(|app_dir| app_dir.join("WebView2Runtime").is_dir())
+        .unwrap_or(false)
+}
+
+fn credential_service(base: &str) -> String {
+    if is_portable_mode() {
+        format!("{base}.portable")
+    } else {
+        base.to_string()
+    }
 }
 
 fn normalized_id(id: &str) -> String {
@@ -2705,8 +2736,11 @@ fn validate_passcode(passcode: &str) -> Result<(), String> {
 }
 
 fn session_passcode_entry() -> Result<Entry> {
-    Entry::new("com.fastpas.client.session", "passcode")
-        .context("failed to open session passcode entry in the OS keychain")
+    Entry::new(
+        &credential_service("com.fastpas.client.session"),
+        "passcode",
+    )
+    .context("failed to open session passcode entry in the OS keychain")
 }
 
 fn store_session_passcode(passcode: &str) -> Result<()> {
@@ -2726,7 +2760,8 @@ fn session_passcode_exists() -> bool {
 }
 
 fn profile_secret_entry(profile_id: &str) -> Result<Entry> {
-    Entry::new("com.fastpas.client", profile_id).context("failed to open OS keychain entry")
+    Entry::new(&credential_service("com.fastpas.client"), profile_id)
+        .context("failed to open OS keychain entry")
 }
 
 fn store_profile_secret(profile_id: &str, client_secret: &str) -> Result<()> {
@@ -2742,7 +2777,8 @@ fn load_profile_secret(profile_id: &str) -> Result<String> {
 }
 
 fn tenant_audit_api_key_entry(tenant_id: &str) -> Result<Entry> {
-    Entry::new("com.fastpas.client.audit", tenant_id).context("failed to open OS keychain entry")
+    Entry::new(&credential_service("com.fastpas.client.audit"), tenant_id)
+        .context("failed to open OS keychain entry")
 }
 
 fn store_tenant_audit_api_key(tenant_id: &str, api_key: &str) -> Result<()> {
@@ -3439,7 +3475,7 @@ fn host_from_url(value: &str) -> Option<String> {
 
 async fn discover_identity_tenant_host(subdomain: &str) -> Option<String> {
     let client = reqwest::Client::builder()
-        .user_agent("FastPAS/0.1.0")
+        .user_agent(concat!("FastPAS/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::limited(10))
         .timeout(std::time::Duration::from_secs(6))
         .build()
