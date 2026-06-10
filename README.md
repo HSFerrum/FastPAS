@@ -1,5 +1,11 @@
 # FastPAS
 
+[![Download FastPAS Portable for Windows x64](https://img.shields.io/badge/Download-FastPAS%20Portable%20for%20Windows%20x64-0078D4?style=for-the-badge&logo=windows)](https://github.com/HSFerrum/FastPAS/releases/download/v0.1.1/FastPAS-portable-windows-x64.zip)
+
+> **Windows users:** Use the download button above. Do not use GitHub's
+> **Code → Download ZIP** option; that downloads the source code and does not
+> include `FastPAS.exe`.
+
 FastPAS is a desktop administration client for CyberArk Identity and Privilege
 Cloud. It combines authentication, common Vault API workflows, operational
 telemetry, CSV reporting, and guarded account remediation in one Tauri
@@ -30,7 +36,7 @@ application.
 
 ### Windows portable release
 
-**[Download FastPAS Portable for Windows x64](https://github.com/HSFerrum/FastPAS/releases/download/v0.1.1/FastPAS-portable-windows-x64.zip)**
+**[Download the complete FastPAS Portable Windows package (277 MB)](https://github.com/HSFerrum/FastPAS/releases/download/v0.1.1/FastPAS-portable-windows-x64.zip)**
 
 1. Download `FastPAS-portable-windows-x64.zip` using the link above.
 2. Extract the complete ZIP.
