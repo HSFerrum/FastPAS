@@ -55,12 +55,15 @@ A Windows executable can also be produced with `cargo-xwin`:
 ```bash
 rustup target add x86_64-pc-windows-msvc
 cargo install cargo-xwin --locked
+npm run build
 cd src-tauri
-cargo xwin build --release --target x86_64-pc-windows-msvc --bin fastpas
+cargo xwin build --release --target x86_64-pc-windows-msvc --bin fastpas --features tauri/custom-protocol
 ```
 
 Native dependencies such as `ring` require `clang-cl` and `lld-link` on the
-Linux host.
+Linux host. The `tauri/custom-protocol` feature is required for production
+builds; without it, Tauri loads the development URL and displays a blank window
+when the Vite server is not running.
 
 ## Release Packaging
 

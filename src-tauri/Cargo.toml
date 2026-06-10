@@ -1,7 +1,7 @@
 [package]
 name = "fastpas"
 default-run = "fastpas"
-version = "0.1.0"
+version = "0.1.1"
 description = "FastPAS standalone CyberArk token helper"
 authors = ["ferrum"]
 edition = "2021"

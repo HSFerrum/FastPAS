@@ -30,7 +30,7 @@ application.
 
 ### Windows portable release
 
-**[Download FastPAS Portable for Windows x64](https://github.com/HSFerrum/FastPAS/releases/download/v0.1.0/FastPAS-portable-windows-x64.zip)**
+**[Download FastPAS Portable for Windows x64](https://github.com/HSFerrum/FastPAS/releases/download/v0.1.1/FastPAS-portable-windows-x64.zip)**
 
 1. Download `FastPAS-portable-windows-x64.zip` using the link above.
 2. Extract the complete ZIP.
