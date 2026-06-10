@@ -30,13 +30,15 @@ application.
 
 ### Windows portable release
 
-1. Download the latest `FastPAS-portable-windows-x64.zip` from
-   [Releases](https://github.com/HSFerrum/FastPAS/releases).
+**[Download FastPAS Portable for Windows x64](https://github.com/HSFerrum/FastPAS/releases/download/v0.1.0/FastPAS-portable-windows-x64.zip)**
+
+1. Download `FastPAS-portable-windows-x64.zip` using the link above.
 2. Extract the complete ZIP.
 3. Run `Run-FastPAS.bat`.
 
 The portable release includes WebView2 and does not require Node.js, Rust, Vite,
-or an installer.
+or an installer. See [all releases](https://github.com/HSFerrum/FastPAS/releases)
+for newer versions.
 
 ### Development
 
