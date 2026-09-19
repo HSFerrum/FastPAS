@@ -32,6 +32,32 @@ cargo check --lib
 cargo test --lib
 ```
 
+## Rotation Health Verification
+
+The shared classification rules and frontend report behavior can be tested
+without native WebView dependencies:
+
+```bash
+cargo test --manifest-path src-tauri/rotation-tests/Cargo.toml
+node scripts/tests/rotation-ui.cjs
+```
+
+These checks cover reported-age boundaries, missing dates, classification,
+platform settings, HTML escaping, CSV deduplication and formula protection,
+and session-context isolation. They do not replace a full Tauri build or testing
+against a tenant with representative CPM/SRS data and permissions.
+
+The local main-window capability must include `dialog:allow-save` for browser
+code to open native export dialogs. The native dialog/permission smoke check is:
+
+```bash
+cargo run --manifest-path src-tauri/Cargo.toml --bin export_dialog_smoke --features tauri/custom-protocol
+```
+
+This check opens an HTML Save dialog using the JavaScript plugin command and
+the same window capability. Cancel the dialog to finish the check; it does not
+load tenant configuration or credentials or write an export file.
+
 ## Windows Portable Package
 
 On Windows, install the Tauri prerequisites and download a Microsoft WebView2

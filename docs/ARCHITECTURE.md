@@ -47,9 +47,31 @@ Responsibilities include:
 - Platform token acquisition
 - Vault API execution
 - Telemetry collection
+- Tenant-aware outbound HTTPS connectivity diagnostics
 - Account remediation and CPM completion polling
 
 Tauri commands form the boundary between the frontend and backend.
+
+## Rotation Health Reporting
+
+`src-tauri/src/rotation_health.rs` collects GET-only account inventories, failed
+operation saved filters, and platform details. `rotation_analysis.rs` contains
+the account classification and platform finding rules. Returned account records
+are allowlisted and never include the secret field. Requests have timeouts and
+do not follow redirects; inventory pagination never follows a server-provided
+URL with an authentication token. Session context is checked between requests.
+
+The report distinguishes observed configuration, review suggestions, and unknown
+coverage. Management modification dates are explicitly not successful-rotation
+evidence. Effective policy and SRS-specific health require additional data sources.
+The frontend hides and discards reports when session context changes and exports
+unique account rows alongside platform findings and coverage warnings.
+
+The shared analysis rules can be tested without native WebView dependencies:
+
+```bash
+cargo test --manifest-path src-tauri/rotation-tests/Cargo.toml
+```
 
 ## Data Storage
 
@@ -73,5 +95,12 @@ Runtime tokens are not written to the configuration file.
 
 FastPAS communicates directly with the configured CyberArk tenant over HTTPS.
 There is no FastPAS cloud service or local API server in production builds.
+
+The outbound firewall diagnostic uses the active tenant, validates an explicit
+HTTPS URL, resolves DNS, connects only to TCP/443, performs normal TLS
+certificate validation, and sends a bounded unauthenticated HTTP request. It
+does not scan address or port ranges. Tenant-specific rules are stored as
+non-secret tenant configuration with a documentation reference; tokens and
+credentials are never attached to diagnostic requests.
 
 The Vite server at `127.0.0.1:5173` is a development-only dependency.

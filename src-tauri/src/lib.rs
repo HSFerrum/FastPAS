@@ -8,14 +8,29 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::Manager;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{lookup_host, TcpStream};
+use tokio::time::timeout;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::TlsConnector;
 use uuid::Uuid;
+
+mod rotation_analysis;
+mod rotation_health;
+mod rotation_actions;
+
+const INTERACTIVE_AUTH_TIMEOUT_SECS: u64 = 20;
+const INTERACTIVE_AUTH_CONNECT_TIMEOUT_SECS: u64 = 8;
 
 #[derive(Default)]
 struct SessionState {
+    rotation_plans: HashMap<String, rotation_actions::ActionPlan>,
+    rotation_action_running: bool,
     active_profile_id: Option<String>,
     active_tenant_id: Option<String>,
     identity_token: Option<RuntimeToken>,
@@ -84,6 +99,70 @@ struct TenantConfig {
     audit_api_key_stored: bool,
     #[serde(default)]
     notes: String,
+    #[serde(default)]
+    outbound_connectivity_rules: Vec<ConfiguredOutboundRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConfiguredOutboundRule {
+    id: String,
+    service: String,
+    name: String,
+    endpoint: String,
+    documentation_url: String,
+    #[serde(default)]
+    notes: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OutboundConnectivityReport {
+    tenant_id: String,
+    tenant_name: String,
+    generated_at: String,
+    disclaimer: String,
+    results: Vec<OutboundConnectivityResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OutboundConnectivityResult {
+    rule_id: String,
+    service: String,
+    name: String,
+    endpoint: String,
+    source: String,
+    documentation_url: String,
+    notes: String,
+    status: String,
+    stage: String,
+    detail: String,
+    testable: bool,
+    passed: bool,
+    http_status: Option<u16>,
+    elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct OutboundConnectivityRule {
+    rule_id: String,
+    service: String,
+    name: String,
+    endpoint: String,
+    source: String,
+    documentation_url: String,
+    notes: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ConnectivityProbeOutcome {
+    status: String,
+    stage: String,
+    detail: String,
+    passed: bool,
+    http_status: Option<u16>,
+    elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,6 +485,7 @@ fn lock_session(
         .lock()
         .map_err(|_| "session state poisoned".to_string())?;
     session.session_locked = true;
+    session.rotation_plans.clear();
     session.identity_token = None;
     session.identity_client = None;
     session.platform_token = None;
@@ -585,6 +665,7 @@ fn save_tenant(
         id: normalized_id(&payload.id),
         ..payload
     };
+    normalize_configured_outbound_rules(&mut tenant.outbound_connectivity_rules)?;
     if tenant.audit_api_base_url.trim().is_empty() {
         let subdomain = tenant_subdomain(&tenant);
         if !subdomain.is_empty() {
@@ -662,6 +743,90 @@ fn set_active_tenant(
     config.active_tenant_id = session.active_tenant_id.clone();
     save_config(&app, &config).map_err(error_to_string)?;
     Ok(build_state_payload(&config, &session))
+}
+
+#[tauri::command]
+async fn run_outbound_connectivity_diagnostic(
+    app: tauri::AppHandle,
+    session: tauri::State<'_, Mutex<SessionState>>,
+) -> Result<OutboundConnectivityReport, String> {
+    let config = load_config(&app).map_err(error_to_string)?;
+    ensure_unlocked(&session)?;
+    let tenant = {
+        let session = session
+            .lock()
+            .map_err(|_| "session state poisoned".to_string())?;
+        find_active_tenant(&config, session.active_tenant_id.as_deref())?
+    };
+
+    let rules = outbound_connectivity_rules(&tenant);
+    let mut probe_cache: HashMap<String, ConnectivityProbeOutcome> = HashMap::new();
+    let mut results = Vec::with_capacity(rules.len());
+
+    for rule in rules {
+        if !rule.enabled {
+            results.push(outbound_result(
+                &rule,
+                ConnectivityProbeOutcome {
+                    status: "not_tested".to_string(),
+                    stage: "Not tested".to_string(),
+                    detail: "This configured rule is disabled.".to_string(),
+                    passed: false,
+                    http_status: None,
+                    elapsed_ms: 0,
+                },
+                !rule.endpoint.is_empty(),
+            ));
+            continue;
+        }
+
+        if rule.endpoint.trim().is_empty() {
+            let configured = rule.source == "tenant-configured";
+            results.push(outbound_result(
+                &rule,
+                ConnectivityProbeOutcome {
+                    status: if configured {
+                        "invalid_rule".to_string()
+                    } else {
+                        "unknown_untestable".to_string()
+                    },
+                    stage: if configured {
+                        "Validation".to_string()
+                    } else {
+                        "Unknown".to_string()
+                    },
+                    detail: if configured {
+                        "This configured rule is missing its HTTPS endpoint.".to_string()
+                    } else {
+                        "FastPAS cannot safely derive a universal endpoint for this product. Add a tenant-specific rule from current CyberArk documentation before testing.".to_string()
+                    },
+                    passed: false,
+                    http_status: None,
+                    elapsed_ms: 0,
+                },
+                false,
+            ));
+            continue;
+        }
+
+        let outcome = if let Some(cached) = probe_cache.get(&rule.endpoint) {
+            cached.clone()
+        } else {
+            let probed = probe_https_endpoint(&rule.endpoint).await;
+            probe_cache.insert(rule.endpoint.clone(), probed.clone());
+            probed
+        };
+        let testable = outcome.status != "invalid_rule";
+        results.push(outbound_result(&rule, outcome, testable));
+    }
+
+    Ok(OutboundConnectivityReport {
+        tenant_id: tenant.id,
+        tenant_name: tenant.name,
+        generated_at: Utc::now().to_rfc3339(),
+        disclaimer: "These checks record DNS, direct TCP/443, TLS certificate, and unauthenticated HTTPS behavior visible from this FastPAS client. A pass does not prove that an application-layer firewall, proxy, or bypass policy is correctly scoped, and an untested rule is not a pass.".to_string(),
+        results,
+    })
 }
 
 #[tauri::command]
@@ -919,6 +1084,10 @@ async fn authenticate_interactive_user(
     let advance_url = format!("https://{identity_host}/Security/AdvanceAuthentication");
     let client = reqwest::Client::builder()
         .cookie_store(true)
+        .connect_timeout(Duration::from_secs(
+            INTERACTIVE_AUTH_CONNECT_TIMEOUT_SECS,
+        ))
+        .timeout(Duration::from_secs(INTERACTIVE_AUTH_TIMEOUT_SECS))
         .build()
         .map_err(error_to_string)?;
 
@@ -940,24 +1109,31 @@ async fn authenticate_interactive_user(
         .json(&start_payload)
         .send()
         .await
-        .map_err(error_to_string)?;
+        .map_err(|error| interactive_request_error("StartAuthentication", &start_url, error))?;
     let start_status = start_response.status();
-    let start_text = start_response.text().await.map_err(error_to_string)?;
-    let start_json: serde_json::Value = serde_json::from_str(&start_text).map_err(|error| {
-        format!(
-            "StartAuthentication response could not be parsed: {} from {}\n{}",
-            error, start_url, start_text
-        )
-    })?;
+    let start_text = start_response
+        .text()
+        .await
+        .map_err(|error| interactive_request_error("StartAuthentication", &start_url, error))?;
+    let start_json = serde_json::from_str::<serde_json::Value>(&start_text);
     if !start_status.is_success() {
-        let preview = serde_json::to_string_pretty(&start_json).unwrap_or(start_text.clone());
+        let detail = start_json
+            .as_ref()
+            .map(|response| interactive_api_error_detail(response))
+            .unwrap_or_else(|_| " CyberArk returned a non-JSON error response.".to_string());
         return Err(format!(
-            "StartAuthentication failed: HTTP {} from {}\n{}",
+            "StartAuthentication failed with HTTP {} from {}.{}",
             start_status.as_u16(),
             start_url,
-            preview
+            detail
         ));
     }
+    let start_json = start_json.map_err(|_| {
+        format!(
+            "StartAuthentication returned an unreadable response from {}. No authentication data was logged.",
+            start_url
+        )
+    })?;
 
     let session_id = start_json
         .pointer("/Result/SessionId")
@@ -1962,6 +2138,557 @@ fn find_active_tenant(
         .ok_or_else(|| "Active tenant was not found.".to_string())
 }
 
+fn outbound_connectivity_rules(tenant: &TenantConfig) -> Vec<OutboundConnectivityRule> {
+    const CYBERARK_DOCS: &str =
+        "https://docs.cyberark.com/ispss-access/latest/en/Content/Resources/_TopNav/cc_Home.htm";
+
+    let identity_endpoint = if !tenant.identity_base_url.trim().is_empty() {
+        https_origin(&tenant.identity_base_url)
+    } else {
+        let host = identity_tenant_host(tenant);
+        if host.is_empty() {
+            String::new()
+        } else {
+            format!("https://{host}/")
+        }
+    };
+    let subdomain = tenant_subdomain(tenant);
+    let shared_services_endpoint = if subdomain.is_empty() {
+        String::new()
+    } else {
+        format!("https://{subdomain}.cyberark.cloud/")
+    };
+    let privilege_cloud_endpoint = https_origin(&tenant.vault_api_base_url);
+
+    let mut rules = vec![
+        built_in_outbound_rule(
+            "identity-tenant",
+            "cyberark_identity",
+            "CyberArk Identity tenant",
+            identity_endpoint,
+            CYBERARK_DOCS,
+            "Tenant-derived Identity origin. This checks the configured tenant host only; it does not enumerate Identity connector or third-party integration destinations.",
+        ),
+        built_in_outbound_rule(
+            "sia-shared-services",
+            "secure_infrastructure_access",
+            "Shared Services tenant entry point",
+            shared_services_endpoint,
+            CYBERARK_DOCS,
+            "Tenant-derived Shared Services origin. Passing does not validate SIA connector, gateway, target, or region-specific requirements.",
+        ),
+        built_in_outbound_rule(
+            "psm-privilege-cloud",
+            "privileged_session_manager",
+            "Privilege Cloud tenant origin",
+            privilege_cloud_endpoint.clone(),
+            CYBERARK_DOCS,
+            "Tenant-derived Privilege Cloud origin used as an observable control-plane check. PSM session targets and component-specific gateways remain outside this rule.",
+        ),
+        built_in_outbound_rule(
+            "cpm-privilege-cloud",
+            "central_policy_manager",
+            "Privilege Cloud tenant origin",
+            privilege_cloud_endpoint,
+            CYBERARK_DOCS,
+            "Tenant-derived Privilege Cloud origin used as an observable control-plane check. CPM-managed target systems are tenant-specific and are not inferred or probed.",
+        ),
+        built_in_outbound_rule(
+            "srs-documentation-required",
+            "secrets_rotation_service",
+            "Tenant-specific SRS endpoint",
+            String::new(),
+            CYBERARK_DOCS,
+            "Secrets Rotation Service requirements can vary by deployment and region, so FastPAS does not invent an endpoint.",
+        ),
+        built_in_outbound_rule(
+            "ccp-documentation-required",
+            "central_credential_provider",
+            "Tenant-specific CCP endpoint",
+            String::new(),
+            CYBERARK_DOCS,
+            "Central Credential Provider topology and outbound requirements are deployment-specific, so FastPAS does not invent an endpoint.",
+        ),
+    ];
+
+    rules.extend(
+        tenant
+            .outbound_connectivity_rules
+            .iter()
+            .take(25)
+            .map(|rule| OutboundConnectivityRule {
+                rule_id: rule.id.clone(),
+                service: rule.service.clone(),
+                name: rule.name.clone(),
+                endpoint: rule.endpoint.clone(),
+                source: "tenant-configured".to_string(),
+                documentation_url: rule.documentation_url.clone(),
+                notes: rule.notes.clone(),
+                enabled: rule.enabled,
+            }),
+    );
+    rules
+}
+
+fn built_in_outbound_rule(
+    rule_id: &str,
+    service: &str,
+    name: &str,
+    endpoint: String,
+    documentation_url: &str,
+    notes: &str,
+) -> OutboundConnectivityRule {
+    OutboundConnectivityRule {
+        rule_id: rule_id.to_string(),
+        service: service.to_string(),
+        name: name.to_string(),
+        endpoint,
+        source: "tenant-derived".to_string(),
+        documentation_url: documentation_url.to_string(),
+        notes: notes.to_string(),
+        enabled: true,
+    }
+}
+
+fn outbound_result(
+    rule: &OutboundConnectivityRule,
+    outcome: ConnectivityProbeOutcome,
+    testable: bool,
+) -> OutboundConnectivityResult {
+    OutboundConnectivityResult {
+        rule_id: rule.rule_id.clone(),
+        service: rule.service.clone(),
+        name: rule.name.clone(),
+        endpoint: rule.endpoint.clone(),
+        source: rule.source.clone(),
+        documentation_url: rule.documentation_url.clone(),
+        notes: rule.notes.clone(),
+        status: outcome.status,
+        stage: outcome.stage,
+        detail: outcome.detail,
+        testable,
+        passed: outcome.passed,
+        http_status: outcome.http_status,
+        elapsed_ms: outcome.elapsed_ms,
+    }
+}
+
+fn normalize_configured_outbound_rules(
+    rules: &mut Vec<ConfiguredOutboundRule>,
+) -> Result<(), String> {
+    if rules.len() > 25 {
+        return Err("A tenant can store at most 25 custom outbound connectivity rules.".to_string());
+    }
+    for rule in rules {
+        rule.id = normalized_id(&rule.id);
+        rule.service = rule.service.trim().to_string();
+        rule.name = rule.name.trim().to_string();
+        rule.endpoint = rule.endpoint.trim().to_string();
+        rule.documentation_url = rule.documentation_url.trim().to_string();
+        rule.notes = rule.notes.trim().to_string();
+        if rule.name.is_empty() {
+            return Err("Each outbound connectivity rule needs a name.".to_string());
+        }
+        if rule.name.len() > 160 || rule.notes.len() > 2000 {
+            return Err(
+                "Outbound rule names must be 160 characters or fewer and notes 2000 characters or fewer."
+                    .to_string(),
+            );
+        }
+        if !is_supported_outbound_service(&rule.service) {
+            return Err(format!(
+                "Unsupported outbound connectivity product area: {}.",
+                rule.service
+            ));
+        }
+        validate_https_endpoint(&rule.endpoint)?;
+        validate_documentation_url(&rule.documentation_url)?;
+    }
+    Ok(())
+}
+
+fn is_supported_outbound_service(service: &str) -> bool {
+    matches!(
+        service,
+        "cyberark_identity"
+            | "secure_infrastructure_access"
+            | "privileged_session_manager"
+            | "central_policy_manager"
+            | "secrets_rotation_service"
+            | "central_credential_provider"
+    )
+}
+
+fn validate_documentation_url(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 2048 {
+        return Err(
+            "Each custom outbound connectivity rule needs a CyberArk documentation reference."
+                .to_string(),
+        );
+    }
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| "The documentation reference must be a valid HTTPS URL.".to_string())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err("The documentation reference must be a valid HTTPS URL.".to_string());
+    }
+    Ok(())
+}
+
+fn validate_https_endpoint(value: &str) -> Result<(reqwest::Url, String, u16), String> {
+    if value.is_empty() || value.len() > 2048 {
+        return Err("The endpoint must be a non-empty HTTPS URL under 2048 characters.".to_string());
+    }
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| "The endpoint must be a valid HTTPS URL.".to_string())?;
+    if url.scheme() != "https" {
+        return Err("Outbound diagnostics only permit HTTPS endpoints.".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Endpoint URLs must not contain credentials.".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(
+            "Endpoint URLs must not contain query strings or fragments; do not place secrets in a diagnostic rule."
+                .to_string(),
+        );
+    }
+    let host = url
+        .host_str()
+        .filter(|host| !host.trim().is_empty())
+        .ok_or_else(|| "The endpoint must include a hostname.".to_string())?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "The endpoint must use HTTPS port 443.".to_string())?;
+    if port != 443 {
+        return Err(
+            "Outbound diagnostics only test HTTPS port 443 and never scan alternate ports."
+                .to_string(),
+        );
+    }
+    Ok((url, host, port))
+}
+
+async fn probe_https_endpoint(endpoint: &str) -> ConnectivityProbeOutcome {
+    let started = Instant::now();
+    let (url, host, port) = match validate_https_endpoint(endpoint) {
+        Ok(parts) => parts,
+        Err(detail) => {
+            return probe_outcome(
+                "invalid_rule",
+                "Validation",
+                detail,
+                false,
+                None,
+                started,
+            )
+        }
+    };
+
+    let addresses = match timeout(Duration::from_secs(4), lookup_host((host.as_str(), port))).await {
+        Err(_) => {
+            return probe_outcome(
+                "dns_failure",
+                "DNS",
+                "DNS lookup timed out.",
+                false,
+                None,
+                started,
+            )
+        }
+        Ok(Err(error)) => {
+            return probe_outcome(
+                "dns_failure",
+                "DNS",
+                format!("DNS lookup failed: {error}"),
+                false,
+                None,
+                started,
+            )
+        }
+        Ok(Ok(addresses)) => addresses.take(4).collect::<Vec<_>>(),
+    };
+    if addresses.is_empty() {
+        return probe_outcome(
+            "dns_failure",
+            "DNS",
+            "DNS lookup returned no addresses.",
+            false,
+            None,
+            started,
+        );
+    }
+
+    let mut tcp_stream = None;
+    let mut tcp_errors = Vec::new();
+    let mut saw_tcp_timeout = false;
+    for address in addresses {
+        match timeout(Duration::from_secs(4), TcpStream::connect(address)).await {
+            Err(_) => saw_tcp_timeout = true,
+            Ok(Err(error)) => tcp_errors.push(error.kind()),
+            Ok(Ok(stream)) => {
+                tcp_stream = Some(stream);
+                break;
+            }
+        }
+    }
+    let tcp_stream = match tcp_stream {
+        Some(stream) => stream,
+        None if tcp_errors.iter().any(|kind| *kind == ErrorKind::ConnectionRefused) => {
+            return probe_outcome(
+                "tcp_refused",
+                "TCP",
+                "The hostname resolved, but the TCP/443 connection was refused.",
+                false,
+                None,
+                started,
+            )
+        }
+        None
+            if tcp_errors.iter().any(|kind| {
+                matches!(
+                    *kind,
+                    ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe
+                )
+            }) =>
+        {
+            return probe_outcome(
+                "tcp_reset",
+                "TCP",
+                "The hostname resolved, but the TCP/443 connection was reset.",
+                false,
+                None,
+                started,
+            )
+        }
+        None if saw_tcp_timeout => {
+            return probe_outcome(
+                "tcp_timeout",
+                "TCP",
+                "The hostname resolved, but the TCP/443 connection timed out.",
+                false,
+                None,
+                started,
+            )
+        }
+        None => {
+            return probe_outcome(
+                "tcp_failure",
+                "TCP",
+                "The hostname resolved, but FastPAS could not establish TCP/443.",
+                false,
+                None,
+                started,
+            )
+        }
+    };
+
+    let root_store =
+        RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut tls_config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = TlsConnector::from(Arc::new(tls_config));
+    let server_name = match host.clone().try_into() {
+        Ok(server_name) => server_name,
+        Err(_) => {
+            return probe_outcome(
+                "tls_failure",
+                "TLS",
+                "The endpoint hostname is not valid for TLS Server Name Indication.",
+                false,
+                None,
+                started,
+            )
+        }
+    };
+    let mut tls_stream =
+        match timeout(Duration::from_secs(6), connector.connect(server_name, tcp_stream)).await {
+            Err(_) => {
+                return probe_outcome(
+                    "tls_failure",
+                    "TLS",
+                    "TCP/443 connected, but the TLS handshake timed out.",
+                    false,
+                    None,
+                    started,
+                )
+            }
+            Ok(Err(error))
+                if matches!(
+                    error.kind(),
+                    ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                ) =>
+            {
+                return probe_outcome(
+                    "tcp_reset",
+                    "TCP",
+                    "TCP/443 connected, but the connection was reset during TLS negotiation.",
+                    false,
+                    None,
+                    started,
+                )
+            }
+            Ok(Err(error)) => {
+                return probe_outcome(
+                    "tls_failure",
+                    "TLS",
+                    format!("TCP/443 connected, but TLS or certificate validation failed: {error}"),
+                    false,
+                    None,
+                    started,
+                )
+            }
+            Ok(Ok(stream)) => stream,
+        };
+
+    let request_target = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    };
+    let request = format!(
+        "GET {request_target} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: FastPAS/0.1 outbound-connectivity-diagnostic\r\nAccept: */*\r\nRange: bytes=0-0\r\nConnection: close\r\n\r\n"
+    );
+    let response_headers = timeout(Duration::from_secs(6), async {
+        tls_stream.write_all(request.as_bytes()).await?;
+        tls_stream.flush().await?;
+        let mut response = Vec::with_capacity(2048);
+        let mut chunk = [0_u8; 1024];
+        while response.len() < 16 * 1024 {
+            let read = tls_stream.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            response.extend_from_slice(&chunk[..read]);
+            if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        Ok::<Vec<u8>, std::io::Error>(response)
+    })
+    .await;
+
+    let response_headers = match response_headers {
+        Err(_) => {
+            return probe_outcome(
+                "http_failure",
+                "HTTP",
+                "DNS, TCP/443, and TLS succeeded, but the HTTPS response timed out.",
+                false,
+                None,
+                started,
+            )
+        }
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+            ) =>
+        {
+            return probe_outcome(
+                "tcp_reset",
+                "TCP",
+                "DNS, TCP/443, and TLS succeeded, but the connection was reset before an HTTP response completed.",
+                false,
+                None,
+                started,
+            )
+        }
+        Ok(Err(error)) => {
+            return probe_outcome(
+                "http_failure",
+                "HTTP",
+                format!(
+                    "DNS, TCP/443, and TLS succeeded, but the HTTPS request failed: {error}"
+                ),
+                false,
+                None,
+                started,
+            )
+        }
+        Ok(Ok(response)) => response,
+    };
+
+    match parse_http_status(&response_headers) {
+        Some(status) if (200..400).contains(&status) => probe_outcome(
+            "http_success",
+            "HTTP",
+            format!("HTTPS returned status {status}. DNS, TCP/443, TLS, and HTTP completed."),
+            true,
+            Some(status),
+            started,
+        ),
+        Some(status) => probe_outcome(
+            "http_failure",
+            "HTTP",
+            format!("HTTPS returned status {status}. The endpoint was reachable, but the unauthenticated request was not an HTTP success."),
+            false,
+            Some(status),
+            started,
+        ),
+        None => probe_outcome(
+            "http_failure",
+            "HTTP",
+            "DNS, TCP/443, and TLS succeeded, but the server did not return a recognizable HTTP status line.",
+            false,
+            None,
+            started,
+        ),
+    }
+}
+
+fn parse_http_status(response: &[u8]) -> Option<u16> {
+    let first_line_end = response.windows(2).position(|window| window == b"\r\n")?;
+    let first_line = std::str::from_utf8(&response[..first_line_end]).ok()?;
+    let mut parts = first_line.split_whitespace();
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") {
+        return None;
+    }
+    parts.next()?.parse().ok()
+}
+
+fn probe_outcome(
+    status: &str,
+    stage: &str,
+    detail: impl Into<String>,
+    passed: bool,
+    http_status: Option<u16>,
+    started: Instant,
+) -> ConnectivityProbeOutcome {
+    ConnectivityProbeOutcome {
+        status: status.to_string(),
+        stage: stage.to_string(),
+        detail: detail.into(),
+        passed,
+        http_status,
+        elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+    }
+}
+
+fn https_origin(value: &str) -> String {
+    reqwest::Url::parse(value.trim())
+        .ok()
+        .filter(|url| url.scheme() == "https")
+        .and_then(|url| {
+            let host = url.host_str()?.to_string();
+            let port = url.port();
+            Some(match port {
+                Some(port) => format!("https://{host}:{port}/"),
+                None => format!("https://{host}/"),
+            })
+        })
+        .unwrap_or_default()
+}
+
 fn load_config(app: &tauri::AppHandle) -> Result<StoredConfig> {
     let path = config_path(app)?;
     if !path.exists() {
@@ -2951,24 +3678,32 @@ async fn apply_interactive_advance(
         .json(request_payload)
         .send()
         .await
-        .map_err(error_to_string)?;
+        .map_err(|error| {
+            interactive_request_error("AdvanceAuthentication", advance_url, error)
+        })?;
     let advance_status = advance_response.status();
-    let advance_text = advance_response.text().await.map_err(error_to_string)?;
-    let advance_json: serde_json::Value = serde_json::from_str(&advance_text).map_err(|error| {
-        format!(
-            "AdvanceAuthentication response could not be parsed: {} from {}\n{}",
-            error, advance_url, advance_text
-        )
+    let advance_text = advance_response.text().await.map_err(|error| {
+        interactive_request_error("AdvanceAuthentication", advance_url, error)
     })?;
+    let advance_json = serde_json::from_str::<serde_json::Value>(&advance_text);
     if !advance_status.is_success() {
-        let preview = serde_json::to_string_pretty(&advance_json).unwrap_or(advance_text.clone());
+        let detail = advance_json
+            .as_ref()
+            .map(|response| interactive_api_error_detail(response))
+            .unwrap_or_else(|_| " CyberArk returned a non-JSON error response.".to_string());
         return Err(format!(
-            "AdvanceAuthentication failed: HTTP {} from {}\n{}",
+            "AdvanceAuthentication failed with HTTP {} from {}.{}",
             advance_status.as_u16(),
             advance_url,
-            preview
+            detail
         ));
     }
+    let advance_json = advance_json.map_err(|_| {
+        format!(
+            "AdvanceAuthentication returned an unreadable response from {}. No authentication data was logged.",
+            advance_url
+        )
+    })?;
 
     let summary = advance_json
         .pointer("/Result/Summary")
@@ -3177,11 +3912,69 @@ async fn apply_interactive_advance(
         }
     }
 
-    let preview = serde_json::to_string_pretty(&working_json).unwrap_or(advance_text);
     Err(format!(
-        "AdvanceAuthentication did not return a token or challenge from {}\n{}",
-        advance_url, preview
+        "AdvanceAuthentication did not return a token or challenge from {}. No authentication data was logged.",
+        advance_url
     ))
+}
+
+fn interactive_request_error(
+    operation: &str,
+    endpoint: &str,
+    error: reqwest::Error,
+) -> String {
+    if error.is_timeout() {
+        return format!(
+            "{operation} timed out after {INTERACTIVE_AUTH_TIMEOUT_SECS} seconds while contacting {endpoint}. Check DNS, proxy, and outbound HTTPS access, then retry."
+        );
+    }
+    if error.is_connect() {
+        return format!(
+            "{operation} could not connect to {endpoint}. Check DNS, proxy, TLS inspection, and outbound HTTPS access, then retry."
+        );
+    }
+    format!(
+        "{operation} failed before CyberArk returned a usable response from {endpoint}. Retry the request or verify the active tenant endpoint."
+    )
+}
+
+fn interactive_api_error_detail(response: &serde_json::Value) -> String {
+    let message = response
+        .get("Message")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            response
+                .pointer("/Result/Message")
+                .and_then(|value| value.as_str())
+        })
+        .unwrap_or_default()
+        .trim();
+    let error_id = response
+        .get("ErrorID")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim();
+    let summary = response
+        .pointer("/Result/Summary")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim();
+
+    let mut details = Vec::new();
+    if !message.is_empty() {
+        details.push(format!(" Message: {message}."));
+    }
+    if !summary.is_empty() {
+        details.push(format!(" Summary: {summary}."));
+    }
+    if !error_id.is_empty() {
+        details.push(format!(" ErrorID: {error_id}."));
+    }
+    if details.is_empty() {
+        " CyberArk did not provide a safe error summary.".to_string()
+    } else {
+        details.concat()
+    }
 }
 
 fn extract_interactive_challenge(
@@ -3439,6 +4232,10 @@ fn default_profile_auth_type() -> String {
     "oauth".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn normalized_profile_auth_type(value: &str) -> String {
     if value.trim().eq_ignore_ascii_case("interactive") {
         "interactive".to_string()
@@ -3544,6 +4341,7 @@ pub fn run() {
             save_tenant,
             delete_tenant,
             set_active_tenant,
+            run_outbound_connectivity_diagnostic,
             request_identity_token,
             request_platform_token,
             copy_runtime_token,
@@ -3552,6 +4350,10 @@ pub fn run() {
             execute_vault_request,
             get_connection_component_telemetry,
             get_account_failure_telemetry,
+            rotation_health::get_rotation_health,
+            rotation_actions::prepare_rotation_action,
+            rotation_actions::apply_rotation_action,
+            rotation_actions::find_rotation_recovery_accounts,
             remediate_account_failures,
             get_active_user_telemetry,
             clear_tokens,
@@ -3580,4 +4382,102 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("failed to run FastPAS");
+}
+
+#[cfg(test)]
+mod outbound_connectivity_tests {
+    use super::*;
+
+    fn tenant_fixture() -> TenantConfig {
+        TenantConfig {
+            id: "tenant-1".to_string(),
+            name: "Production".to_string(),
+            subdomain: "customer".to_string(),
+            identity_tenant_host: "customer.id.cyberark.cloud".to_string(),
+            identity_base_url: String::new(),
+            identity_oauth_url: String::new(),
+            platform_token_url:
+                "https://customer.id.cyberark.cloud/oauth2/platformtoken".to_string(),
+            vault_api_base_url:
+                "https://customer.privilegecloud.cyberark.cloud/PasswordVault/API".to_string(),
+            audit_api_base_url: "https://customer.audit.cyberark.cloud".to_string(),
+            audit_api_key: String::new(),
+            audit_api_key_stored: false,
+            notes: String::new(),
+            outbound_connectivity_rules: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn built_in_rules_cover_all_requested_product_areas() {
+        let rules = outbound_connectivity_rules(&tenant_fixture());
+        let services = rules
+            .iter()
+            .map(|rule| rule.service.as_str())
+            .collect::<Vec<_>>();
+        assert!(services.contains(&"cyberark_identity"));
+        assert!(services.contains(&"secure_infrastructure_access"));
+        assert!(services.contains(&"privileged_session_manager"));
+        assert!(services.contains(&"central_policy_manager"));
+        assert!(services.contains(&"secrets_rotation_service"));
+        assert!(services.contains(&"central_credential_provider"));
+        assert!(rules
+            .iter()
+            .find(|rule| rule.service == "secrets_rotation_service")
+            .expect("SRS rule")
+            .endpoint
+            .is_empty());
+    }
+
+    #[test]
+    fn endpoint_validation_only_allows_https_443_without_secrets() {
+        assert!(validate_https_endpoint("https://tenant.cyberark.cloud/").is_ok());
+        assert!(validate_https_endpoint("http://tenant.cyberark.cloud/").is_err());
+        assert!(validate_https_endpoint("https://tenant.cyberark.cloud:8443/").is_err());
+        assert!(validate_https_endpoint("https://user:secret@tenant.cyberark.cloud/").is_err());
+        assert!(validate_https_endpoint("https://tenant.cyberark.cloud/?token=secret").is_err());
+    }
+
+    #[test]
+    fn configured_rules_require_a_documentation_reference() {
+        let mut rules = vec![ConfiguredOutboundRule {
+            id: String::new(),
+            service: "central_credential_provider".to_string(),
+            name: "Documented CCP service".to_string(),
+            endpoint: "https://ccp.customer.cyberark.cloud/".to_string(),
+            documentation_url: String::new(),
+            notes: String::new(),
+            enabled: true,
+        }];
+        assert!(normalize_configured_outbound_rules(&mut rules).is_err());
+        rules[0].documentation_url = "https://docs.cyberark.com/example".to_string();
+        assert!(normalize_configured_outbound_rules(&mut rules).is_ok());
+        assert!(!rules[0].id.is_empty());
+    }
+
+    #[test]
+    fn http_status_parser_rejects_non_http_responses() {
+        assert_eq!(
+            parse_http_status(b"HTTP/1.1 204 No Content\r\nServer: test\r\n\r\n"),
+            Some(204)
+        );
+        assert_eq!(parse_http_status(b"not http\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn interactive_error_detail_excludes_raw_token_fields() {
+        let response = json!({
+            "Message": "Authentication was denied",
+            "ErrorID": "AUTH-1",
+            "Result": {
+                "Summary": "Failed",
+                "Token": "must-not-be-exposed"
+            }
+        });
+        let detail = interactive_api_error_detail(&response);
+        assert!(detail.contains("Authentication was denied"));
+        assert!(detail.contains("AUTH-1"));
+        assert!(detail.contains("Failed"));
+        assert!(!detail.contains("must-not-be-exposed"));
+    }
 }

@@ -1,11 +1,13 @@
 import "./styles.css";
+import { buildRotationHealthHtml, presentRotationFindings, groupRotationRecommendations } from "./rotation-report.js";
 
 const PAGES = ["api", "tools", "telemetry", "profiles", "tenants", "docs", "settings"];
 const DEBUG_PAGE = "debug";
 const TELEMETRY_DASHBOARDS = [
   { id: "most-used-components", label: "Most Used Components" },
   { id: "active-users", label: "Active Users" },
-  { id: "account-failures", label: "Account Failures" }
+  { id: "account-failures", label: "Account Failures" },
+  { id: "rotation-health", label: "Rotation Health" }
 ];
 const PROFILE_TYPE_OAUTH = "oauth";
 const PROFILE_TYPE_INTERACTIVE = "interactive";
@@ -280,6 +282,12 @@ const state = {
     }
   },
   telemetry: {
+    rotationHealth: null,
+    rotationAction: null,
+    rotationActionBusy: false,
+    rotationLoading: false,
+    rotationError: "",
+    rotationThreshold: 100,
     selectedDashboardId: "most-used-components",
     componentUsage: null,
     componentUsageLoading: false,
@@ -293,6 +301,11 @@ const state = {
     activeUsers: null,
     activeUsersLoading: false,
     activeUsersError: ""
+  },
+  connectivity: {
+    report: null,
+    loading: false,
+    error: ""
   }
 };
 
@@ -412,11 +425,20 @@ function createBridge() {
     getAccountFailureTelemetry() {
       return this.invoke("get_account_failure_telemetry");
     },
+    getRotationHealth(thresholdDays) {
+      return this.invoke("get_rotation_health", { thresholdDays });
+    },
+    prepareRotationAction(payload) { return this.invoke("prepare_rotation_action", {payload}); },
+    applyRotationAction(planId) { return this.invoke("apply_rotation_action", {planId}); },
+    findRotationRecoveryAccounts(objectName) { return this.invoke("find_rotation_recovery_accounts", {objectName}); },
     remediateAccountFailures(payload) {
       return this.invoke("remediate_account_failures", { payload });
     },
     getActiveUserTelemetry() {
       return this.invoke("get_active_user_telemetry");
+    },
+    runOutboundConnectivityDiagnostic() {
+      return this.invoke("run_outbound_connectivity_diagnostic");
     }
   };
 }
@@ -617,6 +639,9 @@ function createBrowserBridge() {
     async remediateAccountFailures() {
       throw new Error("Account remediation is only available in the desktop app.");
     },
+    async getRotationHealth() {
+      throw new Error("Rotation health scanning requires the desktop app and a platform token.");
+    },
     async getActiveUserTelemetry() {
       return {
         generated_at: new Date().toISOString(),
@@ -628,6 +653,9 @@ function createBrowserBridge() {
         identity_recently_inactive_users: [],
         identity_long_inactive_users: []
       };
+    },
+    async runOutboundConnectivityDiagnostic() {
+      throw new Error("Outbound connectivity diagnostics are only available in the desktop app.");
     },
     async exportConfig() {
       const data = load();
@@ -670,6 +698,11 @@ function createBrowserBridge() {
 
 async function refreshSnapshot() {
   state.snapshot = await bridge.getState();
+  if (state.telemetry.rotationHealth && !currentRotationReport()) {
+    state.telemetry.rotationHealth = null;
+    state.telemetry.rotationAction = null;
+    state.telemetry.rotationRecovery = null;
+  }
 }
 
 function render() {
@@ -812,6 +845,9 @@ function renderPage() {
   if (state.page === "tools") {
     return renderToolsPage();
   }
+  if (state.page === "connectivity") {
+    return renderConnectivityPage();
+  }
   if (state.page === "telemetry") {
     return renderTelemetryPage();
   }
@@ -906,10 +942,18 @@ function renderApiPage() {
                 <p class="auth-endpoint">${escapeHtml(interactiveUrls.startAuthenticationUrl || "No interactive endpoint configured")}</p>
               </div>
               <div class="button-row">
-                <button id="request-interactive-token" class="auth-action-button">Authenticate Interactive User <span aria-hidden="true">→</span></button>
-                <button type="button" id="copy-interactive-curl" class="ghost copy-curl-btn">Copy CURL</button>
-                <button type="button" id="copy-interactive-powershell" class="ghost copy-powershell-btn">Copy PowerShell</button>
+                <button id="request-interactive-token" class="auth-action-button" ${state.api.interactiveAuth.pending ? "disabled" : ""}>
+                  ${state.api.interactiveAuth.pending
+                    ? "Starting Interactive Authentication..."
+                    : state.api.interactiveAuth.error
+                      ? "Retry Interactive Authentication"
+                      : "Authenticate Interactive User"}
+                  <span aria-hidden="true">${state.api.interactiveAuth.pending ? "…" : "→"}</span>
+                </button>
+                <button type="button" id="copy-interactive-curl" class="ghost copy-curl-btn" ${state.api.interactiveAuth.pending ? "disabled" : ""}>Copy CURL</button>
+                <button type="button" id="copy-interactive-powershell" class="ghost copy-powershell-btn" ${state.api.interactiveAuth.pending ? "disabled" : ""}>Copy PowerShell</button>
               </div>
+              ${renderInteractiveAuthStatus()}
             </div>
             ` : ""}
           </div>
@@ -2677,15 +2721,229 @@ function renderToolsPage() {
             <strong>Tenant Resolver</strong>
             <span>Review tenant endpoints and Privilege Cloud API bases.</span>
           </button>
-          <button type="button" class="tool-launch-card disabled" disabled>
-            <strong>CSV Utilities</strong>
-            <span>Bulk safe, member, and account workflows can be added here.</span>
+          <button type="button" class="tool-launch-card" data-page="connectivity">
+            <strong>Outbound Firewall Diagnostic</strong>
+            <span>Test explicit HTTPS rules from this client using the active tenant.</span>
           </button>
         </div>
       </section>
       ${renderActivityPanel()}
     </section>
   `;
+}
+
+function renderConnectivityPage() {
+  const tenant = getActiveTenant();
+  const report = state.connectivity.report;
+  const customRules = tenant?.outbound_connectivity_rules || [];
+  const results = report?.results || [
+    ...builtInConnectivityPreview(tenant),
+    ...customRules.map((rule) => ({
+      ...rule,
+      rule_id: rule.id,
+      source: "tenant-configured",
+      status: rule.enabled === false ? "not_tested" : "not_tested",
+      stage: "Not tested",
+      detail: rule.enabled === false ? "This configured rule is disabled." : "Ready to test from this FastPAS client.",
+      testable: true,
+      passed: false,
+      http_status: null,
+      elapsed_ms: 0
+    }))
+  ];
+  const passed = report?.results?.filter((item) => item.passed).length || 0;
+  const failed = report?.results?.filter((item) =>
+    !item.passed && item.status !== "unknown_untestable" && item.status !== "not_tested"
+  ).length || 0;
+  const unknown = report?.results?.filter((item) =>
+    item.status === "unknown_untestable" || item.status === "not_tested"
+  ).length || 0;
+
+  return `
+    <section class="page-grid connectivity-grid">
+      <section class="card connectivity-hero">
+        <div class="card-head connectivity-head">
+          <div>
+            <h3>Outbound Firewall Compliance Diagnostic</h3>
+            <p>Active tenant: <strong>${escapeHtml(tenant?.name || "None")}</strong>. FastPAS sends only ordinary, unauthenticated HTTPS requests to the explicit endpoints shown below.</p>
+          </div>
+          <div class="button-row">
+            <button type="button" class="ghost" data-page="tools">Back To Tools</button>
+            <button id="run-connectivity-diagnostic" type="button" ${!tenant || state.connectivity.loading ? "disabled" : ""}>
+              ${state.connectivity.loading ? "Testing..." : "Run Diagnostic"}
+            </button>
+          </div>
+        </div>
+        <div class="connectivity-disclaimer">
+          <strong>Observable behavior only</strong>
+          <span>A pass confirms what this FastPAS client observed for DNS, direct TCP/443, TLS certificate validation, and HTTP. It cannot prove that an application-layer firewall, proxy, or bypass policy is correctly scoped.</span>
+        </div>
+        <div class="connectivity-stage-strip">
+          <span>DNS failure</span><span>TCP timeout / refusal / reset</span><span>TLS or certificate failure</span><span>HTTP success / failure</span><span>Unknown / untestable</span>
+        </div>
+        ${state.connectivity.error ? `<div class="telemetry-error">${escapeHtml(state.connectivity.error)}</div>` : ""}
+        ${report ? `
+          <div class="telemetry-summary-strip">
+            <div class="context-pill telemetry-pill"><span>Tenant</span><strong>${escapeHtml(report.tenant_name)}</strong></div>
+            <div class="context-pill telemetry-pill active"><span>Passed</span><strong>${passed}</strong></div>
+            <div class="context-pill telemetry-pill ${failed ? "failed" : ""}"><span>Failed</span><strong>${failed}</strong></div>
+            <div class="context-pill telemetry-pill inactive"><span>Unknown / Untested</span><strong>${unknown}</strong></div>
+          </div>
+          <p class="hint">Generated ${escapeHtml(formatTelemetryTimestamp(report.generated_at))}. Duplicate endpoints are probed once and reported for each product rule.</p>
+        ` : ""}
+      </section>
+
+      <section class="card connectivity-results">
+        <div class="card-head">
+          <h3>Explicit Service Rules</h3>
+          <p>Built-in rules use only endpoints already derived from the active tenant. Deployment-specific requirements remain unknown until you add a documented tenant rule.</p>
+        </div>
+        <div class="connectivity-rule-list">
+          ${results.map(renderConnectivityResult).join("")}
+        </div>
+      </section>
+
+      <section class="card connectivity-custom-rules">
+        <div class="card-head">
+          <h3>Tenant-Specific Documented Rules</h3>
+          <p>Add an exact HTTPS/443 endpoint only when current CyberArk documentation or CyberArk support identifies it for this tenant, region, and version. FastPAS never expands hostnames or scans ports.</p>
+        </div>
+        <div class="connectivity-custom-list">
+          ${customRules.length
+            ? customRules.map(renderCustomConnectivityRule).join("")
+            : `<div class="telemetry-empty"><strong>No custom rules.</strong><span>Built-in tenant-derived rules still appear above.</span></div>`}
+        </div>
+        <form id="connectivity-rule-form" class="form-grid connectivity-rule-form">
+          <label class="field">
+            <span>Product area</span>
+            <select name="service">
+              ${connectivityProductOptions().map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}
+            </select>
+          </label>
+          <label class="field"><span>Rule name</span><input name="name" maxlength="160" placeholder="Regional connector service" required /></label>
+          <label class="wide field"><span>HTTPS endpoint (port 443 only)</span><input name="endpoint" type="url" maxlength="2048" placeholder="https://tenant-service.cyberark.cloud/" required /></label>
+          <label class="wide field"><span>CyberArk documentation reference</span><input name="documentation_url" type="url" maxlength="2048" placeholder="https://docs.cyberark.com/..." required /></label>
+          <label class="wide field"><span>Review notes (no secrets)</span><textarea name="notes" rows="3" maxlength="2000" placeholder="Region, product version, gated article title, or support case reference. Never include credentials or tokens."></textarea></label>
+          <div class="button-row wide">
+            <button type="submit" ${!tenant ? "disabled" : ""}>Add Rule To Active Tenant</button>
+          </div>
+        </form>
+      </section>
+    </section>
+  `;
+}
+
+function builtInConnectivityPreview(tenant) {
+  const urls = deriveTenantUrls(tenant);
+  const rule = (ruleId, service, name, endpoint, notes) => ({
+    rule_id: ruleId,
+    service,
+    name,
+    endpoint,
+    source: "tenant-derived",
+    documentation_url: "https://docs.cyberark.com/ispss-access/latest/en/Content/Resources/_TopNav/cc_Home.htm",
+    notes,
+    status: endpoint ? "not_tested" : "unknown_untestable",
+    stage: endpoint ? "Not tested" : "Unknown",
+    detail: endpoint
+      ? "Ready to test from this FastPAS client."
+      : "No universal tenant endpoint can be safely derived. Add a documented tenant-specific rule.",
+    testable: Boolean(endpoint),
+    passed: false,
+    http_status: null,
+    elapsed_ms: 0
+  });
+  return [
+    rule("identity-tenant", "cyberark_identity", "CyberArk Identity tenant", urls.identityHost ? `https://${urls.identityHost}/` : "", "Checks the configured Identity tenant origin only."),
+    rule("sia-shared-services", "secure_infrastructure_access", "Shared Services tenant entry point", urls.sharedServicesUrl ? `${urls.sharedServicesUrl}/` : "", "Does not validate SIA connectors, gateways, targets, or region-specific requirements."),
+    rule("psm-privilege-cloud", "privileged_session_manager", "Privilege Cloud tenant origin", httpsOrigin(urls.vaultApiBaseUrl), "Does not validate session targets or component-specific gateways."),
+    rule("cpm-privilege-cloud", "central_policy_manager", "Privilege Cloud tenant origin", httpsOrigin(urls.vaultApiBaseUrl), "Does not probe CPM-managed target systems."),
+    rule("srs-documentation-required", "secrets_rotation_service", "Tenant-specific SRS endpoint", "", "SRS requirements vary by deployment and region."),
+    rule("ccp-documentation-required", "central_credential_provider", "Tenant-specific CCP endpoint", "", "CCP topology and outbound requirements are deployment-specific.")
+  ];
+}
+
+function renderConnectivityResult(result) {
+  const label = connectivityStatusLabel(result.status);
+  const statusClass = result.passed
+    ? "passed"
+    : result.status === "unknown_untestable" || result.status === "not_tested"
+      ? "unknown"
+      : "failed";
+  return `
+    <article class="connectivity-rule ${statusClass}">
+      <div class="connectivity-rule-head">
+        <div>
+          <span class="step-tag">${escapeHtml(connectivityProductLabel(result.service))}</span>
+          <h4>${escapeHtml(result.name)}</h4>
+        </div>
+        <span class="connectivity-status ${statusClass}">${escapeHtml(label)}</span>
+      </div>
+      <div class="connectivity-endpoint">${escapeHtml(result.endpoint || "Endpoint not safely derivable")}</div>
+      <div class="connectivity-rule-meta">
+        <span>Source: ${escapeHtml(result.source)}</span>
+        <span>Stage: ${escapeHtml(result.stage)}</span>
+        ${result.http_status ? `<span>HTTP: ${Number(result.http_status)}</span>` : ""}
+        ${result.elapsed_ms ? `<span>${Number(result.elapsed_ms)} ms</span>` : ""}
+      </div>
+      <p>${escapeHtml(result.detail)}</p>
+      <small>${escapeHtml(result.notes || "")}</small>
+      ${result.documentation_url ? `<a href="${escapeAttr(result.documentation_url)}" target="_blank" rel="noreferrer">Review CyberArk documentation</a>` : ""}
+    </article>
+  `;
+}
+
+function renderCustomConnectivityRule(rule) {
+  return `
+    <div class="connectivity-custom-rule">
+      <div>
+        <strong>${escapeHtml(rule.name)}</strong>
+        <span>${escapeHtml(connectivityProductLabel(rule.service))}</span>
+        <code>${escapeHtml(rule.endpoint)}</code>
+      </div>
+      <button type="button" class="small danger" data-connectivity-rule-remove="${escapeAttr(rule.id)}">Remove</button>
+    </div>
+  `;
+}
+
+function connectivityProductOptions() {
+  return [
+    ["cyberark_identity", "CyberArk Identity"],
+    ["secure_infrastructure_access", "Secure Infrastructure Access"],
+    ["privileged_session_manager", "Privileged Session Manager"],
+    ["central_policy_manager", "Central Policy Manager"],
+    ["secrets_rotation_service", "Secrets Rotation Service"],
+    ["central_credential_provider", "Central Credential Provider"]
+  ];
+}
+
+function connectivityProductLabel(service) {
+  return connectivityProductOptions().find(([value]) => value === service)?.[1] || service || "Unknown product";
+}
+
+function connectivityStatusLabel(status) {
+  return ({
+    http_success: "HTTP success",
+    http_failure: "HTTP failure",
+    tls_failure: "TLS / certificate failure",
+    tcp_timeout: "TCP timeout",
+    tcp_refused: "TCP refused",
+    tcp_reset: "TCP reset",
+    tcp_failure: "TCP failure",
+    dns_failure: "DNS failure",
+    invalid_rule: "Invalid rule",
+    unknown_untestable: "Unknown / untestable",
+    not_tested: "Not tested"
+  })[status] || status || "Unknown";
+}
+
+function httpsOrigin(value = "") {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" ? `${url.origin}/` : "";
+  } catch {
+    return "";
+  }
 }
 
 function renderTelemetryPage() {
@@ -2753,6 +3011,7 @@ function renderTelemetryPage() {
 }
 
 function renderTelemetryDashboard(dashboardId) {
+  if (dashboardId === "rotation-health") return renderRotationHealthDashboard();
   if (dashboardId === "active-users") {
     return renderActiveUsersDashboard();
   }
@@ -2760,6 +3019,241 @@ function renderTelemetryDashboard(dashboardId) {
     return renderAccountFailuresDashboard();
   }
   return renderMostUsedComponentsDashboard();
+}
+
+function currentRotationReport() {
+  const report = state.telemetry.rotationHealth;
+  return report?.tenant_id === state.snapshot.active_tenant_id && report?.profile_id === state.snapshot.active_profile_id && !state.snapshot.session_locked ? report : null;
+}
+
+function renderRotationRecommendations(platform) {
+  const groups = groupRotationRecommendations(platform);
+  return [["core", "Core issues", "Address these observed management blockers and failures first. Several issues can affect the same account."],
+    ["additional", "Additional recommendations", "Security improvements and configuration reviews that are not established causes of the failure."],
+    ["inspection", "Further investigation", "Validate missing evidence before deciding which changes are needed."]].map(([key, title, text]) => `<section class="rotation-recommendations ${key}"><h4>${title} <span>${groups[key].length}</span></h4><p>${text}</p>${groups[key].length ? `<ul>${groups[key].map(f => `<li><strong>${escapeHtml(f.title)}</strong><p>${escapeHtml(f.summary)}</p><p><strong>Recommended action:</strong> ${escapeHtml(f.recommendation)}</p><details><summary>Supporting evidence · ${escapeHtml(f.level)}</summary><p>${escapeHtml(f.technical)}</p></details></li>`).join("")}</ul>` : '<p>No findings in this section.</p>'}</section>`).join("");
+}
+
+function rotationPlatformAccounts(platform) {
+  return platform.accounts || [...new Map(platform.categories.flatMap(c => c.accounts.map(a => [a.account_id, a]))).values()];
+}
+
+function rotationActionIsCurrent(action) {
+  const report = currentRotationReport();
+  return report && action && action.tenant_id === report.tenant_id && action.profile_id === report.profile_id && action.generated_at === report.generated_at;
+}
+
+function renderRotationPlatformActions(platform, index) {
+  if (platform.actionable === false || ["Unknown platform", "Platform assignment unavailable"].includes(platform.platform_id)) return '<p>Account actions are unavailable until the platform assignment can be verified.</p>';
+  const recovery = state.telemetry.rotationRecovery;
+  const matches = rotationActionIsCurrent(recovery) && recovery.platform_index === index ? recovery.matches : [];
+  return `<details class="rotation-actions"><summary>Administrative actions · ${escapeHtml(platform.platform_id)}</summary>
+    <p>Select the exact accounts to include, then review the proposed action. Changes require CyberArk permissions and are applied individually; partial failures are reported.</p>
+    <form class="rotation-action-form" data-platform-index="${index}">
+      <label>Action<select name="operation"><option value="enable_management">Enable automatic management for disabled accounts</option><option value="reconcile">Request password reconciliation for managed accounts</option><option value="link_recovery">Associate a reconciliation account (account-level override)</option></select></label>
+      <div class="rotation-action-buttons"><button type="button" class="ghost rotation-select" data-selection="disabled">Select disabled accounts</button><button type="button" class="ghost rotation-select" data-selection="managed">Select managed accounts</button><button type="button" class="ghost rotation-select" data-selection="all">Select all visible accounts</button><button type="button" class="ghost rotation-select" data-selection="none">Clear selection</button></div>
+      <details><summary>Choose accounts (${rotationPlatformAccounts(platform).length} visible)</summary><div class="rotation-account-selection">${rotationPlatformAccounts(platform).map(a => `<label><input type="checkbox" name="account_id" value="${escapeAttr(a.account_id)}" data-management="${a.automatic_management_enabled === true ? "managed" : a.automatic_management_enabled === false ? "disabled" : "unknown"}"><span><strong>${escapeHtml(a.name || a.username || "Unnamed account")}</strong> · ${escapeHtml(a.safe_name)} · ${escapeHtml(a.account_id)}<small>${a.automatic_management_enabled === true ? "Automatically managed" : a.automatic_management_enabled === false ? "Management disabled" : "Management unknown"} · ${escapeHtml(a.detail || "No reason returned")}</small></span></label>`).join("")}</div></details>
+      <details class="rotation-recovery-fields"><summary>Platform password-change / reconciliation settings and recovery account lookup</summary>
+        <p>Enter the actual Vault object name. Exact matches in different safes must be selected explicitly. No password is retrieved.</p>
+        <label>Recovery account object name<input name="object_name" value="${escapeAttr(rotationActionIsCurrent(recovery) && recovery.platform_index === index ? recovery.object_name : "")}" placeholder="Exact Vault object name"></label>
+        <button type="button" class="ghost rotation-recovery-search" ${state.telemetry.rotationActionBusy ? "disabled" : ""}>Find recovery account</button>
+        <label>Matching recovery account<select name="recovery_account_id"><option value="">Choose a verified search result</option>${matches.map(a => `<option value="${escapeAttr(a.account_id)}">${escapeHtml(a.name)} · Safe: ${escapeHtml(a.safe)} · ${escapeHtml(a.username)} @ ${escapeHtml(a.address)} · ${escapeHtml(a.account_id)}</option>`).join("")}</select></label>
+        <label>Confirmed Vault folder<input name="recovery_folder" placeholder="Enter the actual folder if the API does not expose it"></label>
+        <p>The standard reconciliation association uses linked-account index 3. Confirm that this platform supports it. Linking accounts replaces their existing reconciliation association; it does not edit platform defaults or enable automatic reconciliation.</p>
+        <button type="button" class="ghost rotation-config-plan" ${state.telemetry.rotationActionBusy ? "disabled" : ""}>Prepare platform settings guide</button>
+        <p>Platform policy editing is not available through the supported platform REST API. The guide provides the exact password-change and automatic-reconciliation settings to apply in CyberArk, with the selected recovery account’s safe, object name, and confirmed folder.</p>
+      </details>
+      <button type="submit" ${state.telemetry.rotationActionBusy ? "disabled" : ""}>Review selected account action</button><p>Maximum 500 accounts per action. Enabling management does not unlock accounts or request reconciliation. Reconciliation acceptance does not confirm a completed password reset.</p>
+    </form></details>`;
+}
+
+function renderRotationActionStatus() {
+  const action = state.telemetry.rotationAction;
+  if (!rotationActionIsCurrent(action)) return "";
+  if (action.review) {
+    const review = action.review;
+    const descriptions = {enable_management: "Enable automatic management", reconcile: "Request password reconciliation", link_recovery: "Replace account-level reconciliation associations"};
+    return `<section class="rotation-review" role="region" aria-label="Review administrative action"><h4>Review: ${descriptions[review.operation]}</h4><p>${escapeHtml(review.platform_id)} · ${review.accounts.length} accounts · Review expires in five minutes.</p>
+      <p>${review.operation === "enable_management" ? "Automatic management will change from disabled to enabled for these accounts. Review each disablement reason and confirm that these accounts should be managed." : review.operation === "reconcile" ? "CyberArk will be asked to reset these credentials using their effective reconciliation identity. This can affect applications using the credentials." : "The existing account-level reconciliation identity will be replaced for the selected accounts. Platform defaults and automatic reconciliation settings will remain governed by the platform."}</p>
+      ${review.recovery ? `<p>Recovery identity: <strong>${escapeHtml(review.recovery.name)}</strong> · Safe: ${escapeHtml(review.recovery.safe)} · Folder: ${escapeHtml(review.recovery.folder)} · ${review.recovery.folder_verified ? "Folder returned by API" : "Folder supplied by administrator"}</p>` : ""}
+      <div class="rotation-account-selection">${review.accounts.map(a => `<p><strong>${escapeHtml(a.name || a.username)}</strong> · ${escapeHtml(a.safe_name)} · ${escapeHtml(a.account_id)}<small>${escapeHtml(a.detail || "No disablement or failure reason returned")}</small></p>`).join("")}</div>
+      <label><input id="rotation-acknowledge" type="checkbox"> I have reviewed this selection and authorize the displayed changes.</label>
+      <button type="button" id="rotation-apply-action" ${state.telemetry.rotationActionBusy ? "disabled" : ""}>${state.telemetry.rotationActionBusy ? "Applying…" : "Apply reviewed action"}</button><button type="button" id="rotation-cancel-action" class="ghost" ${state.telemetry.rotationActionBusy ? "disabled" : ""}>Cancel review</button></section>`;
+  }
+  if (action.result) return `<section class="rotation-review" role="status"><h4>Action results · ${escapeHtml(action.result.platform_id)}</h4><p>${action.result.results.filter(r => r.accepted).length} of ${action.result.results.length} requests accepted. Rescan to verify account settings; check CyberArk activity for completed reconciliation.</p><div class="rotation-account-selection">${action.result.results.map(r => `<p><strong>${escapeHtml(r.name || r.account_id)}</strong> · ${r.accepted ? "Accepted" : "Not accepted"}<small>${escapeHtml(r.detail)}</small></p>`).join("")}</div><button type="button" id="rotation-export-results" class="ghost">Export action results</button></section>`;
+  if (action.configuration) return `<section class="rotation-review"><h4>Platform settings guide · ${escapeHtml(action.configuration.platform_id)}</h4><p>Apply these settings in CyberArk’s platform management interface after reviewing the effective Master Policy and account exceptions. This guide has not modified the platform.</p><pre>${escapeHtml(action.configuration.guide)}</pre><button type="button" id="rotation-export-config" class="ghost">Save platform settings guide</button></section>`;
+  return "";
+}
+
+function rotationFormContext(form) {
+  const report = currentRotationReport();
+  const index = Number(form.dataset.platformIndex);
+  if (!report || !report.platforms[index]) throw new Error("Report context changed. Rescan before continuing.");
+  return {report, index, platform: report.platforms[index], fields: new FormData(form), context: {tenant_id: report.tenant_id, profile_id: report.profile_id, generated_at: report.generated_at}};
+}
+
+async function prepareRotationAction(event) {
+  event.preventDefault();
+  if (state.telemetry.rotationActionBusy) return;
+  try {
+    const {platform, fields, context} = rotationFormContext(event.currentTarget);
+    const ids = fields.getAll("account_id");
+    if (!ids.length || ids.length > 500) throw new Error("Select between 1 and 500 accounts to review.");
+    state.telemetry.rotationActionBusy = true;
+    state.telemetry.rotationError = "";
+    render();
+    const review = await bridge.prepareRotationAction({operation: fields.get("operation"), platform_id: platform.platform_id,
+      account_ids: ids, recovery_account_id: fields.get("recovery_account_id") || null, recovery_folder: fields.get("recovery_folder") || null});
+    if (!rotationActionIsCurrent(context)) throw new Error("Report context changed. Prepare a new review.");
+    state.telemetry.rotationAction = {...context, review};
+  } catch (error) { state.telemetry.rotationError = formatError(error); }
+  finally { state.telemetry.rotationActionBusy = false; render(); document.querySelector(".rotation-review")?.scrollIntoView({block: "start"}); }
+}
+
+async function applyRotationAction() {
+  if (state.telemetry.rotationActionBusy) return;
+  const action = state.telemetry.rotationAction;
+  if (!rotationActionIsCurrent(action) || !action.review) return;
+  if (!document.querySelector("#rotation-acknowledge")?.checked) { state.telemetry.rotationError = "Review the displayed accounts and check the authorization box before applying."; render(); return; }
+  try {
+    state.telemetry.rotationActionBusy = true;
+    state.telemetry.rotationError = "";
+    render();
+    const result = await bridge.applyRotationAction(action.review.plan_id);
+    if (rotationActionIsCurrent(action)) state.telemetry.rotationAction = {...action, review: null, result};
+    log(`Rotation action submitted: ${result.operation}; ${result.results.filter(r => r.accepted).length}/${result.results.length} accepted.`);
+  } catch (error) { state.telemetry.rotationAction = null; state.telemetry.rotationError = formatError(error); }
+  finally { state.telemetry.rotationActionBusy = false; render(); }
+}
+
+async function findRotationRecoveryAccount(event) {
+  if (state.telemetry.rotationActionBusy) return;
+  let platformIndex;
+  try {
+    const {fields, index, context} = rotationFormContext(event.currentTarget.closest("form"));
+    platformIndex = index;
+    const name = fields.get("object_name").trim();
+    if (!name) throw new Error("Enter the exact recovery account object name.");
+    state.telemetry.rotationActionBusy = true;
+    state.telemetry.rotationError = "";
+    render();
+    const found = await bridge.findRotationRecoveryAccounts(name);
+    if (!rotationActionIsCurrent(context)) throw new Error("Report context changed. Search again.");
+    state.telemetry.rotationRecovery = {...context, platform_index: index, object_name: name, matches: found.matches};
+    if (!found.matches.length) state.telemetry.rotationError = "No visible account exactly matches that object name. Check spelling and safe permissions.";
+  } catch (error) { state.telemetry.rotationError = formatError(error); }
+  finally {
+    state.telemetry.rotationActionBusy = false; render();
+    const form = document.querySelector(`.rotation-action-form[data-platform-index="${platformIndex}"]`);
+    if (form) { form.closest(".rotation-platform").open = true; form.closest(".rotation-actions").open = true; form.querySelector(".rotation-recovery-fields").open = true; form.querySelector('[name="recovery_account_id"]').focus(); }
+  }
+}
+
+function prepareRotationConfiguration(event) {
+  try {
+    const {fields, platform, index, context} = rotationFormContext(event.currentTarget.closest("form"));
+    const recovery = state.telemetry.rotationRecovery;
+    const selected = rotationActionIsCurrent(recovery) && recovery.platform_index === index ? recovery.matches.find(a => a.account_id === fields.get("recovery_account_id")) : null;
+    const folder = selected?.folder || fields.get("recovery_folder").trim();
+    if (selected && !folder) throw new Error("Enter the recovery account’s confirmed Vault folder; it will not be guessed.");
+    const guide = `Platform: ${platform.platform_id}\n\nPassword change\nPerformChangeTask = Yes\nPerformPeriodicChange = Yes\nReview Master Policy rotation interval, exceptions, execution days and maintenance window.\n\nPassword reconciliation\nPerformReconcileTask = Yes\nAutomaticReconcileWhenUnsynched = Yes\n${selected ? `ReconcileAccountSafe = ${selected.safe}\nReconcileAccountName = ${selected.name}\nReconcileAccountFolder = ${folder}\nRecovery account ID: ${selected.account_id}\nFolder source: ${selected.folder ? "API response" : "administrator supplied"}` : "Choose a recovery account using exact object-name lookup to populate its safe, object and folder. Enable automatic reconciliation only after validating the effective recovery identity."}\n\nValidate recovery-account safe visibility and target reset permissions. Check account-level reconciliation overrides. Apply only supported settings for this platform. Rescan afterward and confirm successful target changes in CyberArk activity.\n\nPrepared guide only: no platform settings have been changed.`;
+    state.telemetry.rotationAction = {...context, configuration: {platform_id: platform.platform_id, guide}};
+    state.telemetry.rotationError = ""; render(); document.querySelector(".rotation-review")?.scrollIntoView({block: "start"});
+  } catch (error) { state.telemetry.rotationError = formatError(error); render(); }
+}
+
+function renderRotationHealthDashboard() {
+  const report = currentRotationReport();
+  return `<section class="card telemetry-dashboard-panel rotation-health">
+    <div class="card-head"><h3>Rotation Health</h3><p>Review management blockers, investigate account failures, and apply reviewed account actions by platform.</p></div>
+    <form id="rotation-health-form" class="rotation-controls">
+      <label>Reported age threshold (days)<input id="rotation-threshold" type="number" min="1" max="3650" required value="${state.telemetry.rotationThreshold}" ${state.telemetry.rotationLoading ? "disabled" : ""}></label>
+      <button type="submit" ${state.telemetry.rotationLoading ? "disabled" : ""}>${state.telemetry.rotationLoading ? "Scanning accounts and platforms…" : "Scan active tenant"}</button>
+      <button type="button" class="ghost" id="export-rotation-health" ${report ? "" : "disabled"}>Export CSV</button>
+      <button type="button" class="ghost" id="export-rotation-html" ${report ? "" : "disabled"}>Export HTML dashboard</button>
+    </form>
+    ${state.telemetry.rotationError ? `<p role="alert">${escapeHtml(state.telemetry.rotationError)}</p>` : ""}
+    ${state.telemetry.rotationActionBusy ? '<p role="status">Working on the administrative request. Current account details are checked individually; large selections may take several minutes.</p>' : ""}
+    ${renderRotationActionStatus()}
+    ${report ? `<p>${escapeHtml(report.tenant_name)} · ${escapeHtml(formatTelemetryTimestamp(report.generated_at))} · Threshold: ${report.threshold_days} days</p>
+      <div class="telemetry-metrics">
+        <div class="context-pill"><span>Visible accounts scanned</span><strong>${report.total_accounts}</strong></div>
+        <div class="context-pill"><span>Unique accounts with findings</span><strong>${report.affected_accounts}</strong></div>
+        <div class="context-pill"><span>Platforms requiring review</span><strong>${report.platforms.length}</strong></div>
+        <div class="context-pill"><span>Inventory pagination</span><strong>${report.inventory_complete ? "Complete for visible scope" : "Incomplete"}</strong></div>
+      </div>
+      <details class="rotation-notes" open><summary>Evidence and coverage limitations</summary><ul>${report.warnings.map(w => `<li>${escapeHtml(w)}</li>`).join("")}</ul><p>Category totals overlap. Platform totals count accounts once. Accounts outside these groups have no matching findings in the returned metadata; successful rotation is not confirmed.</p></details>
+      ${report.platforms.length ? report.platforms.map((platform, platformIndex) => `<details class="rotation-platform">
+        <summary>${escapeHtml(platform.platform_id)} — ${platform.affected_accounts} / ${platform.total_accounts} visible accounts with findings · Oldest reported age: ${platform.oldest_reported_age_days ?? "unknown"}${platform.oldest_reported_age_days == null ? "" : " days"}</summary>
+        <div class="rotation-platform-body">${renderRotationRecommendations(platform)}${renderRotationPlatformActions(platform, platformIndex)}
+        ${platform.categories.map(category => `<details class="rotation-category"><summary>${escapeHtml(category.label)} (${category.accounts.length})</summary>
+          <div class="rotation-table-scroll"><table class="rotation-table"><thead><tr><th>Account / ID</th><th>Safe / target</th><th>Reported change date / age</th><th>Management</th><th>Issues / original detail</th></tr></thead><tbody>
+          ${category.accounts.map(a => `<tr><td>${escapeHtml(a.name || a.username || "Unnamed")}<small>${escapeHtml(a.account_id)}</small></td>
+            <td>${escapeHtml(a.safe_name)}<small>${escapeHtml(a.username)} @ ${escapeHtml(a.address)}</small></td>
+            <td>${a.reported_change_time ? escapeHtml(formatTelemetryTimestamp(a.reported_change_time)) : "Unknown"}<small>${a.reported_age_days == null ? "Unknown age" : `${a.reported_age_days} days`} · target rotation unconfirmed</small></td>
+            <td>${a.automatic_management_enabled == null ? "Unknown" : a.automatic_management_enabled ? "Automatic" : "Disabled"}<small>${escapeHtml(a.status || "Status unavailable")}</small></td>
+            <td>${escapeHtml(a.issues.join("; "))}<small>${escapeHtml(a.detail || "No additional detail returned")}</small></td></tr>`).join("")}
+          </tbody></table></div></details>`).join("")}</div></details>`).join("") : "<p>No matching account or confirmed platform findings were returned. Review coverage limitations before drawing conclusions.</p>"}`
+      : "<p>Scan the active tenant to inspect visible accounts and platform configuration. Passwords are never retrieved. Reported dates do not prove a successful target rotation; no effective policy interval is assumed.</p>"}
+  </section>`;
+}
+
+async function refreshRotationHealth(event) {
+  event.preventDefault();
+  if (state.telemetry.rotationLoading || state.telemetry.rotationActionBusy) return;
+  const threshold = Number(document.querySelector("#rotation-threshold").value);
+  if (!Number.isInteger(threshold) || threshold < 1 || threshold > 3650) return;
+  state.telemetry.rotationThreshold = threshold;
+  state.telemetry.rotationLoading = true;
+  state.telemetry.rotationError = "";
+  state.telemetry.rotationHealth = null;
+  state.telemetry.rotationAction = null;
+  state.telemetry.rotationRecovery = null;
+  const tenantId = state.snapshot.active_tenant_id;
+  const profileId = state.snapshot.active_profile_id;
+  render();
+  try {
+    const report = await bridge.getRotationHealth(threshold);
+    await refreshSnapshot();
+    if (tenantId !== state.snapshot.active_tenant_id || profileId !== state.snapshot.active_profile_id || state.snapshot.session_locked) {
+      throw new Error("Session context changed during the scan. Run it again.");
+    }
+    state.telemetry.rotationHealth = report;
+    log(`Rotation health scanned ${report.total_accounts} visible accounts.`);
+  } catch (error) {
+    state.telemetry.rotationError = formatError(error);
+  } finally {
+    state.telemetry.rotationLoading = false;
+    render();
+  }
+}
+
+function exportRotationHealth() {
+  const report = currentRotationReport();
+  if (!report) return;
+  const rows = [["record_type", "tenant", "generated_at", "threshold_days", "inventory_complete", "platform", "account_id", "account_name", "safe", "username", "address", "reported_change_time", "reported_age_days", "automatic_management_enabled", "status", "issues", "evidence"]];
+  // Neutralize spreadsheet formulas in any tenant-controlled field.
+  const cell = value => typeof value === "string" && /^[\s]*[=+@-]/.test(value) ? `'${value}` : value;
+  const context = [report.tenant_name, report.generated_at, report.threshold_days, report.inventory_complete];
+  for (const warning of report.warnings) rows.push(["coverage", ...context, "", "", "", "", "", "", "", "", "", "", "", warning]);
+  for (const platform of report.platforms) {
+    for (const f of platform.findings) rows.push(["platform_finding", ...context, platform.platform_id, "", "", "", "", "", "", "", "", "", `${f.level}: ${f.title}`, f.evidence]);
+    const accounts = new Map(platform.categories.flatMap(c => c.accounts.map(a => [a.account_id, a])));
+    for (const a of accounts.values()) rows.push(["account", ...context, platform.platform_id, a.account_id, a.name, a.safe_name, a.username, a.address, a.reported_change_time, a.reported_age_days, a.automatic_management_enabled, a.status, a.issues.join("; "), `${a.age_evidence}; ${a.detail}`]);
+  }
+  saveDownload(toCsv(rows.map(row => row.map(cell))), "text/csv;charset=utf-8", "fastpas-rotation-health.csv", "csv").catch(error => { log(formatError(error)); render(); });
+}
+
+async function exportRotationHtml() {
+  const report = currentRotationReport();
+  if (!report) return;
+  state.telemetry.rotationError = "";
+  try {
+    await saveDownload(buildRotationHealthHtml(report), "text/html;charset=utf-8", `fastpas-rotation-health-${report.generated_at.slice(0, 10)}.html`, "html");
+  } catch (error) {
+    state.telemetry.rotationError = `HTML export failed: ${formatError(error)}`;
+    log(state.telemetry.rotationError);
+    render();
+  }
 }
 
 function renderMostUsedComponentsDashboard() {
@@ -3430,6 +3924,25 @@ function renderDebugPage() {
 }
 
 function wireEvents() {
+  document.querySelectorAll(".rotation-action-form").forEach(form => form.addEventListener("submit", prepareRotationAction));
+  document.querySelectorAll(".rotation-select").forEach(button => button.addEventListener("click", () => {
+    button.closest("form").querySelectorAll('input[name="account_id"]').forEach(box => { box.checked = button.dataset.selection === "all" || box.dataset.management === button.dataset.selection; });
+  }));
+  document.querySelectorAll(".rotation-recovery-search").forEach(button => button.addEventListener("click", findRotationRecoveryAccount));
+  document.querySelectorAll(".rotation-config-plan").forEach(button => button.addEventListener("click", prepareRotationConfiguration));
+  bind("#rotation-apply-action", "click", applyRotationAction);
+  bind("#rotation-cancel-action", "click", () => { state.telemetry.rotationAction = null; render(); });
+  bind("#rotation-export-config", "click", () => {
+    const action = state.telemetry.rotationAction;
+    if (rotationActionIsCurrent(action) && action.configuration) saveDownload(action.configuration.guide, "text/plain;charset=utf-8", "fastpas-platform-settings.txt", "txt").catch(error => { state.telemetry.rotationError = formatError(error); render(); });
+  });
+  bind("#rotation-export-results", "click", () => {
+    const action = state.telemetry.rotationAction;
+    if (rotationActionIsCurrent(action) && action.result) saveDownload(JSON.stringify(action.result, null, 2), "application/json", "fastpas-rotation-action-results.json", "json").catch(error => { state.telemetry.rotationError = formatError(error); render(); });
+  });
+  bind("#rotation-health-form", "submit", refreshRotationHealth);
+  bind("#export-rotation-health", "click", exportRotationHealth);
+  bind("#export-rotation-html", "click", exportRotationHtml);
   document.querySelectorAll("[data-page]").forEach((button) => {
     button.addEventListener("click", () => {
       state.page = button.dataset.page;
@@ -3458,6 +3971,80 @@ function wireEvents() {
   bind("#export-unlocked-remediation-failures", "click", () => {
     const payload = remediationCsv(state.telemetry.accountRemediation?.unlocked_account_failures || []);
     saveDownload(payload, "text/csv;charset=utf-8", "fastpas-unresolved-unlocked-accounts.csv", "csv").catch((error) => log(formatError(error)));
+  });
+
+  bind("#run-connectivity-diagnostic", "click", async () => {
+    state.connectivity.loading = true;
+    state.connectivity.error = "";
+    render();
+    try {
+      state.connectivity.report = await bridge.runOutboundConnectivityDiagnostic();
+      log(`Completed outbound connectivity diagnostic for ${state.connectivity.report.tenant_name}.`);
+    } catch (error) {
+      state.connectivity.error = formatError(error);
+      log(`Outbound connectivity diagnostic failed: ${formatError(error)}`);
+    } finally {
+      state.connectivity.loading = false;
+      render();
+    }
+  });
+
+  bind("#connectivity-rule-form", "submit", async (event) => {
+    event.preventDefault();
+    const tenant = getActiveTenant();
+    if (!tenant) {
+      log("Set an active tenant before adding an outbound connectivity rule.");
+      render();
+      return;
+    }
+    const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+    const nextRule = {
+      id: crypto.randomUUID(),
+      service: values.service || "",
+      name: values.name || "",
+      endpoint: values.endpoint || "",
+      documentation_url: values.documentation_url || "",
+      notes: values.notes || "",
+      enabled: true
+    };
+    try {
+      state.snapshot = await bridge.saveTenant({
+        ...normalizeTenant(tenant, tenant.id),
+        outbound_connectivity_rules: [...(tenant.outbound_connectivity_rules || []), nextRule]
+      });
+      state.forms.tenant = normalizeTenant(getActiveTenant(), tenant.id);
+      state.connectivity.report = null;
+      log(`Added outbound connectivity rule ${nextRule.name || "unnamed"}.`);
+      render();
+    } catch (error) {
+      state.connectivity.error = formatError(error);
+      log(formatError(error));
+      render();
+    }
+  });
+
+  document.querySelectorAll("[data-connectivity-rule-remove]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const tenant = getActiveTenant();
+      if (!tenant) {
+        return;
+      }
+      const ruleId = button.dataset.connectivityRuleRemove;
+      try {
+        state.snapshot = await bridge.saveTenant({
+          ...normalizeTenant(tenant, tenant.id),
+          outbound_connectivity_rules: (tenant.outbound_connectivity_rules || []).filter((rule) => rule.id !== ruleId)
+        });
+        state.forms.tenant = normalizeTenant(getActiveTenant(), tenant.id);
+        state.connectivity.report = null;
+        log("Removed tenant-specific outbound connectivity rule.");
+        render();
+      } catch (error) {
+        state.connectivity.error = formatError(error);
+        log(formatError(error));
+        render();
+      }
+    });
   });
 
   bind("#settings-general-form", "change", (event) => {
@@ -3639,13 +4226,27 @@ function wireEvents() {
   });
 
   bind("#request-interactive-token", "click", async () => {
+    if (state.api.interactiveAuth.pending) {
+      return;
+    }
+    stopInteractivePolling();
+    state.api.interactiveAuth = {
+      ...emptyInteractiveAuthState(),
+      pending: true,
+      pendingMessage: "Contacting CyberArk Identity and starting interactive authentication..."
+    };
+    render();
     try {
       const result = await bridge.authenticateInteractiveUser();
       applyInteractiveAuthResult(result);
       log(result.message || "Interactive authentication step completed.");
-      render();
     } catch (error) {
-      log(formatError(error));
+      const message = interactiveAuthDisplayError(error);
+      state.api.interactiveAuth.error = message;
+      log(message);
+    } finally {
+      state.api.interactiveAuth.pending = false;
+      state.api.interactiveAuth.pendingMessage = "";
       render();
     }
   });
@@ -3927,6 +4528,7 @@ function wireEvents() {
   bind("#tenant-form", "submit", async (event) => {
     event.preventDefault();
     let payload = Object.fromEntries(new FormData(event.currentTarget).entries());
+    payload.outbound_connectivity_rules = state.forms.tenant.outbound_connectivity_rules || [];
     if (payload.subdomain?.trim()) {
       const resolution = await bridge.resolveTenant(payload.subdomain);
       payload = {
@@ -3950,6 +4552,8 @@ function wireEvents() {
       return;
     }
     state.snapshot = await bridge.setActiveTenant(state.forms.tenant.id);
+    state.connectivity.report = null;
+    state.connectivity.error = "";
     log(`Set active tenant to ${state.forms.tenant.name}.`);
     render();
   });
@@ -3959,6 +4563,8 @@ function wireEvents() {
       return;
     }
     state.snapshot = await bridge.deleteTenant(state.forms.tenant.id);
+    state.connectivity.report = null;
+    state.connectivity.error = "";
     syncFormsFromSelection();
     log("Deleted tenant.");
     render();
@@ -3975,6 +4581,8 @@ function wireEvents() {
   document.querySelectorAll("[data-tenant-active]").forEach((button) => {
     button.addEventListener("click", async () => {
       state.snapshot = await bridge.setActiveTenant(button.dataset.tenantActive);
+      state.connectivity.report = null;
+      state.connectivity.error = "";
       log("Updated active tenant.");
       render();
     });
@@ -3986,12 +4594,19 @@ function wireEvents() {
 }
 
 async function submitInteractiveAuthStep(payload) {
+  if (state.api.interactiveAuth.pending) {
+    return;
+  }
   state.api.interactiveAuth.mechanismId = payload.mechanism_id || "";
   state.api.interactiveAuth.action = payload.action || "Answer";
   state.api.interactiveAuth.answer = payload.answer || "";
+  state.api.interactiveAuth.pending = true;
+  state.api.interactiveAuth.pendingMessage = "Submitting the interactive challenge to CyberArk Identity...";
+  state.api.interactiveAuth.error = "";
   if ((payload.action || "").toLowerCase() !== "poll") {
     stopInteractivePolling();
   }
+  render();
   try {
     const result = await bridge.advanceInteractiveAuthentication({
       mechanism_id: payload.mechanism_id || "",
@@ -4000,9 +4615,13 @@ async function submitInteractiveAuthStep(payload) {
     });
     applyInteractiveAuthResult(result);
     log(result.message || "Interactive authentication step completed.");
-    render();
   } catch (error) {
-    log(formatError(error));
+    const message = interactiveAuthDisplayError(error);
+    state.api.interactiveAuth.error = message;
+    log(message);
+  } finally {
+    state.api.interactiveAuth.pending = false;
+    state.api.interactiveAuth.pendingMessage = "";
     render();
   }
 }
@@ -4070,7 +4689,18 @@ function normalizeTenant(payload, id) {
     audit_api_base_url: payload.audit_api_base_url || "",
     audit_api_key: payload.audit_api_key || "",
     audit_api_key_stored: Boolean(payload.audit_api_key_stored),
-    notes: payload.notes || ""
+    notes: payload.notes || "",
+    outbound_connectivity_rules: Array.isArray(payload.outbound_connectivity_rules)
+      ? payload.outbound_connectivity_rules.map((rule) => ({
+          id: rule.id || crypto.randomUUID(),
+          service: rule.service || "",
+          name: rule.name || "",
+          endpoint: rule.endpoint || "",
+          documentation_url: rule.documentation_url || "",
+          notes: rule.notes || "",
+          enabled: rule.enabled !== false
+        }))
+      : []
   };
 }
 
@@ -4439,8 +5069,19 @@ function emptyInteractiveAuthState() {
     action: "Answer",
     answer: "",
     message: "",
-    polling: false
+    polling: false,
+    pending: false,
+    pendingMessage: "",
+    error: ""
   };
+}
+
+function interactiveAuthDisplayError(error) {
+  const firstLine = formatError(error)
+    .split(/\r?\n/, 1)[0]
+    .trim()
+    .slice(0, 500);
+  return firstLine || "Interactive authentication failed before CyberArk returned a usable response.";
 }
 
 function tokenStatus(token) {
@@ -4498,7 +5139,8 @@ function emptyTenant() {
     audit_api_base_url: "",
     audit_api_key: "",
     audit_api_key_stored: false,
-    notes: ""
+    notes: "",
+    outbound_connectivity_rules: []
   };
 }
 
@@ -4639,11 +5281,38 @@ function renderInteractiveChallengePanel() {
         <input name="answer" value="${escapeAttr(state.api.interactiveAuth.answer || "")}" placeholder="Enter code or answer if this action requires it" />
       </label>
       <div class="button-row wide">
-        <button type="button" class="ghost" data-interactive-quick-action="${escapeAttr(quickActions.sendAction || "")}" ${quickActions.sendAction ? "" : "disabled"}>${escapeHtml(sendButtonLabel)}</button>
-        <button type="submit">Continue Interactive Auth</button>
+        <button type="button" class="ghost" data-interactive-quick-action="${escapeAttr(quickActions.sendAction || "")}" ${quickActions.sendAction && !state.api.interactiveAuth.pending ? "" : "disabled"}>${escapeHtml(sendButtonLabel)}</button>
+        <button type="submit" ${state.api.interactiveAuth.pending ? "disabled" : ""}>${state.api.interactiveAuth.pending ? "Submitting..." : "Continue Interactive Auth"}</button>
       </div>
     </form>
   `;
+}
+
+function renderInteractiveAuthStatus() {
+  if (state.api.interactiveAuth.pending) {
+    return `
+      <div class="interactive-auth-notice pending" role="status" aria-live="polite">
+        <span class="interactive-auth-spinner" aria-hidden="true"></span>
+        <div>
+          <strong>Authentication request in progress</strong>
+          <p>${escapeHtml(state.api.interactiveAuth.pendingMessage || "Waiting for CyberArk Identity...")}</p>
+          <small>The network request is bounded and will stop with an error if the tenant cannot be reached.</small>
+        </div>
+      </div>
+    `;
+  }
+  if (state.api.interactiveAuth.error) {
+    return `
+      <div class="interactive-auth-notice failed" role="alert">
+        <div>
+          <strong>Interactive authentication failed</strong>
+          <p>${escapeHtml(state.api.interactiveAuth.error)}</p>
+          <small>Verify the active interactive profile, Identity host, proxy, and outbound HTTPS access, then retry.</small>
+        </div>
+      </div>
+    `;
+  }
+  return "";
 }
 
 function applyInteractiveAuthResult(result) {
@@ -4664,7 +5333,10 @@ function applyInteractiveAuthResult(result) {
     action: result.challenge?.mechanisms?.[0]?.actions?.[0] || "Answer",
     answer: "",
     message: result.message || "",
-    polling: false
+    polling: false,
+    pending: false,
+    pendingMessage: "",
+    error: ""
   };
   if (shouldAutoPollInteractiveChallenge(result.challenge, state.api.interactiveAuth.mechanismId)) {
     startInteractivePolling(state.api.interactiveAuth.mechanismId);
@@ -4753,7 +5425,9 @@ function startInteractivePolling(mechanismId = "") {
       render();
     } catch (error) {
       stopInteractivePolling();
-      log(formatError(error));
+      const message = interactiveAuthDisplayError(error);
+      state.api.interactiveAuth.error = message;
+      log(message);
       render();
     } finally {
       interactivePollInFlight = false;
