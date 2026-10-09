@@ -65,19 +65,23 @@ management is separate from operation failure; manual disablement notes are not
 treated as failure evidence. Explicit error text can add connectivity, permission,
 authentication, password-policy, and dependency issue tags.
 
-Age uses the latest valid management modification/reconciliation timestamp;
-verification and account-property modification dates do not reset it. These dates
-are **reported metadata, not confirmation of successful target rotation**. Missing,
-zero, invalid, or future timestamps produce an unknown-history finding. Successful
-manual target changes cannot yet be distinguished from Vault-only updates or
-unsuccessful attempts using this metadata. This dashboard does not certify rotation
-compliance or infer an effective Master Policy interval.
+The scan first uses the latest valid management modification/reconciliation
+timestamp; verification and account-property modification dates do not reset it.
+For affected accounts, FastPAS then requests CyberArk compliance details and the
+extended account overview. When available, the compliance endpoint supplies the
+last successful change, effective policy interval, next schedule, action state,
+and action disablement reason. That authoritative successful-change timestamp
+replaces the preliminary metadata age. The overview adds CPM status and error
+details, dependency failures, and linked-account visibility without retrieving a
+secret. Older deployments or restricted identities may not expose either endpoint;
+FastPAS reports one coverage warning instead of creating a finding for every
+missing field.
 
-Platform inspection reports explicitly disabled processing settings and inactive
-platforms. Schedule and reconciliation-credential settings are review findings,
-not established causes. Missing settings, permission failures, effective-policy
-overrides, linked credentials, and SRS-specific engine health remain explicit
-coverage limitations. The scan includes only accounts visible to the active
+Platform inspection reports inactive platforms and disabled processing settings
+only when the affected account groups make those settings relevant. Missing
+platform keys and caller permission limitations are not reported as rotation
+failures. Effective account-level policy exceptions and SRS-specific engine health
+remain coverage limitations. The scan includes only accounts visible to the active
 identity. Pagination has a 500,000-account safety limit per inventory; repeated
 pages or reaching that limit mark the inventory incomplete. Failed classification
 queries are reported without discarding the main account inventory.
@@ -150,6 +154,33 @@ recommendations** (security and configuration improvements), and **Further
 investigation** (unavailable evidence). A failure does not automatically establish
 its root cause. The standalone HTML dashboard includes the same sections and
 remains an offline snapshot.
+
+The dashboard opens with a prioritized command center:
+
+- **Start first** counts unique accounts with confirmed management blockers or
+  reported change/reconciliation failures.
+- **Work next** identifies unique overdue or verification accounts that do not
+  already have a higher-priority blocker.
+- **Investigate** identifies accounts whose management settings or rotation
+  history are unavailable.
+- Compact priority shortcuts open the most urgent work queues immediately.
+- The **Investigation workspace** switches between **Work queues** and
+  **Platforms**. Work queues summarize one card per platform instead of listing
+  every affected account.
+- Selecting a platform shows compact failure-group tiles. One selected group
+  occupies the detail area with shared evidence, age range, disabled count, and
+  the recommended next step.
+- Account identities remain hidden by default. An administrator can reveal a
+  fixed-height sample of up to 50 accounts or export the complete CSV inventory.
+  The dashboard never renders hundreds of account rows into the main workspace.
+- Administrative actions use a failure group as their scope. FastPAS resolves
+  that group to unique account IDs and presents the exact list in the protected
+  review step before any request is applied.
+
+Work-queue counts can overlap when an account has several issues. The urgency
+totals assign each account only to its highest-priority tier. The exported HTML
+dashboard uses the same priority model and a static ranked overview for portable
+offline review.
 
 Expand a platform's **Administrative actions** to select visible accounts and:
 

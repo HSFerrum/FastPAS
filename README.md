@@ -20,7 +20,7 @@ application.
 - Guided Vault API requests for accounts, safes, platforms, users, and members
 - CSV exports for API responses and telemetry dashboards
 - Telemetry for PSM component usage, Identity user activity, and account failures
-- Rotation health inventory grouped by platform and account issue, with configurable reported-age threshold, configuration findings, and CSV export
+- Platform-first rotation health workspace with failure-group remediation, CyberArk compliance/CPM evidence, focused configuration findings, and CSV/HTML export
 - Tenant-aware outbound HTTPS connectivity diagnostics with explicit, reviewable rules
 - Bulk remediation for accounts with automatic management disabled
 - Lock detection, account unlock, management re-enable, reconcile, and CPM status polling

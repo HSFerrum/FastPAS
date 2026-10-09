@@ -12,13 +12,13 @@ const sandbox = {console, Date, window: {matchMedia: () => ({matches: false})}, 
   document: {querySelector: selector => selector === '#rotation-acknowledge' ? {checked: acknowledged} : null},
   FormData: class {constructor(form) {this.fields = form.fields;} get(key) {return this.fields[key] || '';} getAll(key) {return this.fields[key] || [];}}};
 vm.createContext(sandbox);
-Object.assign(sandbox, vm.runInContext(`(()=>{${reportSource};return {buildRotationHealthHtml,presentRotationFindings,groupRotationRecommendations};})()`, sandbox));
+Object.assign(sandbox, vm.runInContext(`(()=>{${reportSource};return {buildRotationHealthHtml,presentRotationFindings,groupRotationRecommendations,buildRotationInsights,rotationIssueBucket};})()`, sandbox));
 vm.runInContext(source + '\nglobalThis.api={state,bridge,prepareRotationAction,applyRotationAction,prepareRotationConfiguration,renderRotationActionStatus,renderRotationHealthDashboard};render=()=>{};log=()=>{};', sandbox);
 const {api} = sandbox;
 const account = {account_id:'1_1',name:'Service account',safe_name:'Application credentials',username:'svc',address:'example',automatic_management_enabled:false,issues:['Automatic management disabled'],detail:'Approved maintenance exclusion'};
 api.state.snapshot.active_tenant_id = 'tenant'; api.state.snapshot.active_profile_id = 'profile'; api.state.snapshot.session_locked = false;
 api.state.telemetry.rotationHealth = {tenant_id:'tenant',profile_id:'profile',tenant_name:'Synthetic demonstration',generated_at:'2026-09-17T00:00:00Z',threshold_days:100,total_accounts:1,affected_accounts:1,inventory_complete:true,warnings:['Synthetic data only'],platforms:[{platform_id:'Windows',total_accounts:1,affected_accounts:1,disabled_accounts:1,accounts:[account],findings:[{level:'Confirmed setting',title:'Periodic password change disabled',evidence:'PerformPeriodicChange = No'},{level:'Confirmed setting',title:'Periodic verification disabled',evidence:'PerformPeriodicVerification = No'}],categories:[{label:'Automatic management disabled',accounts:[account]}]}]};
-const form = {dataset:{platformIndex:'0'},fields:{operation:'enable_management',account_id:['1_1']}};
+const form = {dataset:{platformIndex:'0'},fields:{operation:'enable_management',cohort:'Automatic management disabled'}};
 let prepared = 0, applied = 0;
 api.bridge.prepareRotationAction = async payload => {prepared++; assert.equal(payload.platform_id,'Windows'); assert.equal(payload.account_ids.length,1); return {plan_id:'plan',operation:payload.operation,platform_id:'Windows',accounts:[account]};};
 api.bridge.applyRotationAction = async () => {applied++; return {operation:'enable_management',platform_id:'Windows',results:[{account_id:'1_1',name:'Service account',accepted:true,detail:'Configuration update accepted.'},{account_id:'1_2',name:'Second account',accepted:false,detail:'HTTP 403. Check permissions.'}]};};
@@ -40,8 +40,9 @@ api.bridge.applyRotationAction = async () => {applied++; return {operation:'enab
   assert.ok(api.state.telemetry.rotationError.includes('context changed'));
   assert.equal(api.renderRotationActionStatus(),'');
   api.state.snapshot.active_profile_id='profile';
-  form.fields.account_id=[]; await api.prepareRotationAction(event);
-  assert.ok(api.state.telemetry.rotationError.includes('between 1 and 500'));
+  form.fields.cohort=''; await api.prepareRotationAction(event);
+  assert.ok(api.state.telemetry.rotationError.includes('Choose a failure group'));
+  form.fields.cohort='Automatic management disabled';
   api.state.telemetry.rotationAction=null; api.state.telemetry.rotationError='';
   api.prepareRotationConfiguration({currentTarget:{closest:()=>form}});
   assert.ok(api.renderRotationActionStatus().includes('PerformPeriodicChange = Yes'));

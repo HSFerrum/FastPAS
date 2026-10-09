@@ -56,16 +56,34 @@ pub(crate) fn classify_account(
     .unwrap_or_default();
     let modified = timestamp(management.get("lastModifiedTime"), now);
     let reconciled = timestamp(management.get("lastReconciledTime"), now);
+    let created = timestamp(account.get("createdTime"), now);
     let reported = modified.into_iter().chain(reconciled).max();
     let age = reported.map(|time| (now - time).num_days());
-    let mut issues = failures.cloned().unwrap_or_default();
+    let observed = failures.cloned().unwrap_or_default();
+    let has_classified_failure = observed.iter().any(|label| {
+        matches!(
+            label.as_str(),
+            "Change failed"
+                | "Reconcile failed"
+                | "Verification failed"
+                | "Platform policy failure"
+        )
+    });
+    let mut issues: Vec<String> = observed
+        .iter()
+        .filter(|label| !label.starts_with("Automatic management disabled by"))
+        .cloned()
+        .collect();
     if enabled == Some(false) {
-        issues.push("Automatic management disabled".into());
+        issues.push(
+            observed
+                .iter()
+                .find(|label| label.starts_with("Automatic management disabled by"))
+                .cloned()
+                .unwrap_or_else(|| "Automatic management disabled".into()),
+        );
     }
-    if enabled.is_none() {
-        issues.push("Management setting unknown".into());
-    }
-    if status.eq_ignore_ascii_case("failure") && failures.map(|f| f.is_empty()).unwrap_or(true) {
+    if status.eq_ignore_ascii_case("failure") && !has_classified_failure {
         issues.push("Management failed — operation unknown".into());
     }
     if reported
@@ -75,7 +93,7 @@ pub(crate) fn classify_account(
         issues.push("Reported age exceeds threshold".into());
     }
     let failure_detail = audit_string(management, &["failureReason", "lastTaskFailureReason"]);
-    if status.eq_ignore_ascii_case("failure") || failures.map(|f| !f.is_empty()).unwrap_or(false) {
+    if status.eq_ignore_ascii_case("failure") || has_classified_failure {
         if let Some(error) = failure_detail {
             let error = error.to_ascii_lowercase();
             for (needles, label) in [
@@ -120,8 +138,13 @@ pub(crate) fn classify_account(
             }
         }
     }
-    if reported.is_none() {
-        issues.push("Rotation history unavailable".into());
+    if reported.is_none()
+        && issues.is_empty()
+        && created
+            .map(|time| (now - time).num_seconds() > threshold as i64 * 86400)
+            .unwrap_or(false)
+    {
+        issues.push("No management activity timestamp above threshold".into());
     }
     // Confirmation is a separate coverage limitation, not a failure assigned to every account.
     json!({"account_id": audit_string(account, &["id", "ID"]).unwrap_or_default(),
@@ -132,6 +155,7 @@ pub(crate) fn classify_account(
         "platform_id": platform_id(account).unwrap_or("Platform assignment unavailable".into()),
         "automatic_management_enabled": enabled, "status": status, "detail": reason,
         "reported_change_time": reported.map(|t| t.to_rfc3339()), "reported_age_days": age,
+        "created_time": created.map(|t| t.to_rfc3339()), "account_age_days": created.map(|t| (now-t).num_days()),
         "age_evidence": "Management metadata only; successful target rotation unconfirmed", "issues": issues})
 }
 
@@ -179,7 +203,14 @@ fn settings(value: &Value, path: &str, result: &mut Vec<(String, String, Value)>
     }
 }
 
-pub(crate) fn platform_findings(platform: &Value) -> Vec<Value> {
+#[derive(Default)]
+pub(crate) struct PlatformFindingContext {
+    pub change_needed: bool,
+    pub reconcile_needed: bool,
+    pub verification_needed: bool,
+}
+
+pub(crate) fn platform_findings(platform: &Value, context: &PlatformFindingContext) -> Vec<Value> {
     let mut fields = Vec::new();
     settings(platform, "", &mut fields);
     let mut findings = Vec::new();
@@ -195,31 +226,45 @@ pub(crate) fn platform_findings(platform: &Value) -> Vec<Value> {
             "Platform API reports Active = false. Review effective policy and relevant exceptions.",
         ));
     }
-    for (key, title) in [
-        ("PerformPeriodicChange", "Periodic password change disabled"),
-        ("PerformChangeTask", "Password change processing disabled"),
+    for (needed, key, title) in [
         (
+            context.change_needed,
+            "PerformPeriodicChange",
+            "Periodic password change disabled",
+        ),
+        (
+            context.change_needed,
+            "PerformChangeTask",
+            "Password change processing disabled",
+        ),
+        (
+            context.verification_needed,
             "PerformPeriodicVerification",
             "Periodic verification disabled",
         ),
-        ("PerformVerifyTask", "Verification processing disabled"),
         (
+            context.verification_needed,
+            "PerformVerifyTask",
+            "Verification processing disabled",
+        ),
+        (
+            context.reconcile_needed,
             "AutomaticReconcileWhenUnsynched",
             "Automatic reconciliation when unsynchronized disabled",
         ),
-        ("PerformReconcileTask", "Reconciliation processing disabled"),
+        (
+            context.reconcile_needed,
+            "PerformReconcileTask",
+            "Reconciliation processing disabled",
+        ),
     ] {
+        if !needed {
+            continue;
+        }
         let matches: Vec<_> = fields
             .iter()
             .filter(|(name, _, _)| name.eq_ignore_ascii_case(key))
             .collect();
-        if matches.is_empty() {
-            findings.push(finding(
-                "Unknown",
-                &format!("{key} not exposed"),
-                "Missing settings are not treated as enabled or disabled.",
-            ));
-        }
         for (_, path, value) in matches {
             let disabled = value == &Value::Bool(false)
                 || value
@@ -236,30 +281,15 @@ pub(crate) fn platform_findings(platform: &Value) -> Vec<Value> {
         }
     }
     for (key, path, value) in &fields {
-        if [
-            "FromHour",
-            "ToHour",
-            "ExecutionDays",
-            "ReconcileAccountSafe",
-            "ReconcileAccountName",
-            "ReconcileAccountFolder",
-            "PasswordChangeInterval",
-            "MinValidityPeriod",
-        ]
-        .iter()
-        .any(|k| key.eq_ignore_ascii_case(k))
-        {
-            findings.push(finding("Review", "Schedule or credential configuration", &format!("{path} = {value}. Review effective policy, scheduling, and account-level overrides; this setting alone does not prove a cause.")));
-        }
         if ["ReconcileAccountSafe", "ReconcileAccountName"]
             .iter()
             .any(|k| key.eq_ignore_ascii_case(k))
+            && context.reconcile_needed
             && value.as_str() == Some("")
         {
             findings.push(finding("Review", "Platform reconciliation credential setting is empty", &format!("{path} is empty. An account-level association may override this; only an effective missing credential blocks workflows that require reconciliation.")));
         }
     }
-    findings.push(finding("Unknown", "Effective policy and linked credentials require further inspection", "No effective rotation interval or missing reconciliation credential is inferred from omitted fields. SRS engine attribution is unconfirmed unless exposed by tenant-specific APIs."));
     findings
 }
 
@@ -280,7 +310,7 @@ mod tests {
             .contains(&json!("Reported age exceeds threshold")));
     }
     #[test]
-    fn unknown_and_future_dates_are_not_healthy() {
+    fn missing_dates_only_become_findings_for_old_accounts() {
         let now = Utc::now();
         let row = classify_account(
             &json!({"secretManagement": {"lastModifiedTime": now.timestamp()+86400}}),
@@ -289,10 +319,20 @@ mod tests {
             now,
         );
         assert!(row["reported_age_days"].is_null());
-        assert!(row["issues"]
+        assert!(!row["issues"]
             .as_array()
             .unwrap()
-            .contains(&json!("Rotation history unavailable")));
+            .contains(&json!("No management activity timestamp above threshold")));
+        let old = classify_account(
+            &json!({"createdTime": now.timestamp()-101*86400, "secretManagement": {"automaticManagementEnabled": true}}),
+            None,
+            100,
+            now,
+        );
+        assert!(old["issues"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("No management activity timestamp above threshold")));
     }
     #[test]
     fn disabled_is_not_automatically_a_failed_operation() {
@@ -324,9 +364,18 @@ mod tests {
     }
     #[test]
     fn missing_platform_settings_do_not_become_confirmed_failures() {
-        let findings = platform_findings(&json!({}));
+        let context = PlatformFindingContext {
+            change_needed: true,
+            reconcile_needed: true,
+            verification_needed: true,
+        };
+        let findings = platform_findings(&json!({}), &context);
         assert!(findings.iter().all(|f| f["level"] != "Confirmed setting"));
-        let findings = platform_findings(&json!({"Details": {"PerformPeriodicChange": "No"}}));
+        assert!(findings.is_empty());
+        let findings = platform_findings(
+            &json!({"Details": {"PerformPeriodicChange": "No"}}),
+            &context,
+        );
         assert!(findings.iter().any(|f| f["level"] == "Confirmed setting"));
     }
     #[test]
@@ -348,6 +397,10 @@ mod tests {
     fn property_pairs_and_inactive_platform_are_supported() {
         let findings = platform_findings(
             &json!({"Active": false, "Properties": [{"Key": "PerformChangeTask", "Value": "No"}]}),
+            &PlatformFindingContext {
+                change_needed: true,
+                ..Default::default()
+            },
         );
         assert_eq!(
             findings
@@ -355,6 +408,49 @@ mod tests {
                 .filter(|f| f["level"] == "Confirmed setting")
                 .count(),
             2
+        );
+    }
+    #[test]
+    fn unrelated_platform_settings_are_suppressed() {
+        let platform = json!({"Properties": [
+            {"Key": "PerformChangeTask", "Value": "No"},
+            {"Key": "FromHour", "Value": "22"},
+            {"Key": "ReconcileAccountName", "Value": ""}
+        ]});
+        assert!(platform_findings(&platform, &PlatformFindingContext::default()).is_empty());
+        let change = platform_findings(
+            &platform,
+            &PlatformFindingContext {
+                change_needed: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(change.len(), 1);
+        assert_eq!(change[0]["title"], "Password change processing disabled");
+        let reconcile = platform_findings(
+            &platform,
+            &PlatformFindingContext {
+                reconcile_needed: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(reconcile.len(), 1);
+        assert_eq!(
+            reconcile[0]["title"],
+            "Platform reconciliation credential setting is empty"
+        );
+    }
+    #[test]
+    fn disablement_origin_replaces_the_generic_label() {
+        let row = classify_account(
+            &json!({"secretManagement": {"automaticManagementEnabled": false}}),
+            Some(&vec!["Automatic management disabled by CPM".into()]),
+            100,
+            Utc::now(),
+        );
+        assert_eq!(
+            row["issues"],
+            json!(["Automatic management disabled by CPM"])
         );
     }
     #[test]

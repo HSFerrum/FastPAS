@@ -1,5 +1,5 @@
 import "./styles.css";
-import { buildRotationHealthHtml, presentRotationFindings, groupRotationRecommendations } from "./rotation-report.js";
+import { buildRotationHealthHtml, presentRotationFindings, groupRotationRecommendations, buildRotationInsights, rotationIssueBucket } from "./rotation-report.js";
 
 const PAGES = ["api", "tools", "telemetry", "profiles", "tenants", "docs", "settings"];
 const DEBUG_PAGE = "debug";
@@ -285,6 +285,12 @@ const state = {
     rotationHealth: null,
     rotationAction: null,
     rotationActionBusy: false,
+    rotationWorkspaceMode: "queues",
+    rotationSelectedQueue: "",
+    rotationSelectedPlatform: 0,
+    rotationSelectedCohort: "",
+    rotationShowCohortAccounts: false,
+    rotationActionCohort: "",
     rotationLoading: false,
     rotationError: "",
     rotationThreshold: 100,
@@ -702,6 +708,9 @@ async function refreshSnapshot() {
     state.telemetry.rotationHealth = null;
     state.telemetry.rotationAction = null;
     state.telemetry.rotationRecovery = null;
+    state.telemetry.rotationWorkspaceMode = "queues";
+    state.telemetry.rotationSelectedQueue = "";
+    state.telemetry.rotationSelectedPlatform = 0;
   }
 }
 
@@ -3046,12 +3055,13 @@ function renderRotationPlatformActions(platform, index) {
   if (platform.actionable === false || ["Unknown platform", "Platform assignment unavailable"].includes(platform.platform_id)) return '<p>Account actions are unavailable until the platform assignment can be verified.</p>';
   const recovery = state.telemetry.rotationRecovery;
   const matches = rotationActionIsCurrent(recovery) && recovery.platform_index === index ? recovery.matches : [];
-  return `<details class="rotation-actions"><summary>Administrative actions · ${escapeHtml(platform.platform_id)}</summary>
-    <p>Select the exact accounts to include, then review the proposed action. Changes require CyberArk permissions and are applied individually; partial failures are reported.</p>
+  const selectedCohort = platform.categories.some(category => category.label === state.telemetry.rotationActionCohort) ? state.telemetry.rotationActionCohort : "";
+  return `<details class="rotation-actions"><summary>Resolve a failure group · ${escapeHtml(platform.platform_id)}</summary>
+    <p>Choose a failure group and one administrative action. FastPAS resolves the group to its unique accounts and presents the exact scope for review before making changes.</p>
     <form class="rotation-action-form" data-platform-index="${index}">
       <label>Action<select name="operation"><option value="enable_management">Enable automatic management for disabled accounts</option><option value="reconcile">Request password reconciliation for managed accounts</option><option value="link_recovery">Associate a reconciliation account (account-level override)</option></select></label>
-      <div class="rotation-action-buttons"><button type="button" class="ghost rotation-select" data-selection="disabled">Select disabled accounts</button><button type="button" class="ghost rotation-select" data-selection="managed">Select managed accounts</button><button type="button" class="ghost rotation-select" data-selection="all">Select all visible accounts</button><button type="button" class="ghost rotation-select" data-selection="none">Clear selection</button></div>
-      <details><summary>Choose accounts (${rotationPlatformAccounts(platform).length} visible)</summary><div class="rotation-account-selection">${rotationPlatformAccounts(platform).map(a => `<label><input type="checkbox" name="account_id" value="${escapeAttr(a.account_id)}" data-management="${a.automatic_management_enabled === true ? "managed" : a.automatic_management_enabled === false ? "disabled" : "unknown"}"><span><strong>${escapeHtml(a.name || a.username || "Unnamed account")}</strong> · ${escapeHtml(a.safe_name)} · ${escapeHtml(a.account_id)}<small>${a.automatic_management_enabled === true ? "Automatically managed" : a.automatic_management_enabled === false ? "Management disabled" : "Management unknown"} · ${escapeHtml(a.detail || "No reason returned")}</small></span></label>`).join("")}</div></details>
+      <label>Failure group<select name="cohort" required><option value="">Choose a group</option>${platform.categories.map(category => `<option value="${escapeAttr(category.label)}" ${category.label === selectedCohort ? "selected" : ""}>${escapeHtml(category.label)} · ${category.accounts.length} accounts</option>`).join("")}</select></label>
+      <p class="cohort-action-note">Groups can overlap. The review screen deduplicates the selected group and shows the exact accounts before the action can be authorized.</p>
       <details class="rotation-recovery-fields"><summary>Platform password-change / reconciliation settings and recovery account lookup</summary>
         <p>Enter the actual Vault object name. Exact matches in different safes must be selected explicitly. No password is retrieved.</p>
         <label>Recovery account object name<input name="object_name" value="${escapeAttr(rotationActionIsCurrent(recovery) && recovery.platform_index === index ? recovery.object_name : "")}" placeholder="Exact Vault object name"></label>
@@ -3062,7 +3072,7 @@ function renderRotationPlatformActions(platform, index) {
         <button type="button" class="ghost rotation-config-plan" ${state.telemetry.rotationActionBusy ? "disabled" : ""}>Prepare platform settings guide</button>
         <p>Platform policy editing is not available through the supported platform REST API. The guide provides the exact password-change and automatic-reconciliation settings to apply in CyberArk, with the selected recovery account’s safe, object name, and confirmed folder.</p>
       </details>
-      <button type="submit" ${state.telemetry.rotationActionBusy ? "disabled" : ""}>Review selected account action</button><p>Maximum 500 accounts per action. Enabling management does not unlock accounts or request reconciliation. Reconciliation acceptance does not confirm a completed password reset.</p>
+      <button type="submit" ${state.telemetry.rotationActionBusy ? "disabled" : ""}>Review group action</button><p>Maximum 500 accounts per action. Enabling management does not unlock accounts or request reconciliation. Reconciliation acceptance does not confirm a completed password reset.</p>
     </form></details>`;
 }
 
@@ -3096,8 +3106,11 @@ async function prepareRotationAction(event) {
   if (state.telemetry.rotationActionBusy) return;
   try {
     const {platform, fields, context} = rotationFormContext(event.currentTarget);
-    const ids = fields.getAll("account_id");
-    if (!ids.length || ids.length > 500) throw new Error("Select between 1 and 500 accounts to review.");
+    const cohortLabel = String(fields.get("cohort") || "");
+    const cohort = platform.categories.find(category => category.label === cohortLabel);
+    if (!cohort) throw new Error("Choose a failure group to review.");
+    const ids = [...new Set(cohort.accounts.map(account => account.account_id).filter(Boolean))];
+    if (!ids.length || ids.length > 500) throw new Error("The selected group must contain between 1 and 500 unique accounts.");
     state.telemetry.rotationActionBusy = true;
     state.telemetry.rotationError = "";
     render();
@@ -3144,7 +3157,12 @@ async function findRotationRecoveryAccount(event) {
   finally {
     state.telemetry.rotationActionBusy = false; render();
     const form = document.querySelector(`.rotation-action-form[data-platform-index="${platformIndex}"]`);
-    if (form) { form.closest(".rotation-platform").open = true; form.closest(".rotation-actions").open = true; form.querySelector(".rotation-recovery-fields").open = true; form.querySelector('[name="recovery_account_id"]').focus(); }
+    if (form) {
+      form.closest(".rotation-actions").open = true;
+      form.querySelector(".rotation-recovery-fields").open = true;
+      form.querySelector('[name="recovery_account_id"]').focus();
+      form.closest(".rotation-workspace")?.scrollIntoView({block: "start"});
+    }
   }
 }
 
@@ -3161,6 +3179,109 @@ function prepareRotationConfiguration(event) {
   } catch (error) { state.telemetry.rotationError = formatError(error); render(); }
 }
 
+function renderRotationCommandCenter(report) {
+  const insights = buildRotationInsights(report);
+  const first = insights.work_queues[0];
+  const urgentPlatforms = insights.platforms.filter(platform => platform.tier === 1).length;
+  const nextPlatforms = insights.platforms.filter(platform => platform.tier === 2).length;
+  const reviewPlatforms = insights.platforms.filter(platform => platform.tier === 3).length;
+  const headline = urgentPlatforms
+    ? `${urgentPlatforms} platform${urgentPlatforms === 1 ? " needs" : "s need"} immediate attention`
+    : nextPlatforms ? `${nextPlatforms} platform${nextPlatforms === 1 ? " is" : "s are"} next in the queue`
+    : reviewPlatforms ? `${reviewPlatforms} platform${reviewPlatforms === 1 ? " needs" : "s need"} more evidence`
+    : "No prioritized platform work was identified";
+  return `<section class="rotation-command-center" aria-labelledby="rotation-priority-heading">
+    <div class="rotation-priority-hero"><div><span class="eyebrow">Recommended starting point</span><h4 id="rotation-priority-heading">${escapeHtml(headline)}</h4><p>${first ? `${escapeHtml(first.label)} is the largest highest-priority work queue: ${first.account_count} account${first.account_count === 1 ? "" : "s"} across ${first.platform_count} platform${first.platform_count === 1 ? "" : "s"}.` : "Review the coverage section before treating the visible scope as complete."}</p></div>${first ? `<button type="button" class="rotation-quick-queue" data-queue="${escapeAttr(first.label)}">Open first work queue</button>` : ""}</div>
+    <div class="rotation-priority-metrics">
+      <div class="priority-metric urgent"><span>Start first</span><strong>${urgentPlatforms}</strong><small>Platforms with confirmed blockers or reported management failures</small></div>
+      <div class="priority-metric watch"><span>Work next</span><strong>${nextPlatforms}</strong><small>Platforms led by overdue or verification groups</small></div>
+      <div class="priority-metric investigate"><span>Investigate</span><strong>${reviewPlatforms}</strong><small>Platforms whose leading groups need more evidence</small></div>
+      <div class="priority-metric"><span>Failure groups</span><strong>${insights.work_queues.length}</strong><small>${report.affected_accounts} affected accounts across ${insights.platforms.length} platforms</small></div>
+    </div>
+    <div class="rotation-quick-actions" aria-label="Highest priority work queues">${insights.work_queues.slice(0, 5).map(queue => `<button type="button" class="rotation-quick-queue" data-queue="${escapeAttr(queue.label)}"><span class="priority-rank p${queue.priority}">${queue.priority === 1 ? "Start first" : queue.priority === 2 ? "Next" : "Investigate"}</span><strong>${escapeHtml(queue.label)}</strong><small>${queue.platform_count} platform${queue.platform_count === 1 ? "" : "s"} · ${queue.account_count} accounts</small></button>`).join("")}</div>
+  </section>`;
+}
+
+function accountMatchesRotationQueue(account, queueLabel) {
+  const issues = account.issues || [];
+  const specificFailure = issues.some(issue => /^Reported (authentication|permission|connectivity|password-policy|dependency)/i.test(issue));
+  return issues.some(issue => !(specificFailure && /^(Change|Reconcile|Verification) failed$/i.test(issue)) && rotationIssueBucket(issue).label === queueLabel);
+}
+
+function renderRotationQueueDetail(report, queue) {
+  if (!queue) return '<div class="rotation-workspace-empty"><h4>No work queue selected</h4><p>Select a queue or platform to begin.</p></div>';
+  const groups = report.platforms.map((platform, index) => ({platform, index, accounts: rotationPlatformAccounts(platform).filter(account => accountMatchesRotationQueue(account, queue.label))})).filter(group => group.accounts.length);
+  return `<section class="rotation-workspace-detail"><div class="workspace-detail-head"><div><span class="priority-rank p${queue.priority}">${queue.priority === 1 ? "Start first" : queue.priority === 2 ? "Work next" : "Investigate"}</span><h4>${escapeHtml(queue.label)}</h4><p>${escapeHtml(queue.next_step)}</p></div><div class="workspace-count"><strong>${queue.account_count}</strong><span>accounts</span></div></div>
+    <p class="workspace-guidance">This queue is summarized by platform. Open the platform that affects the most accounts, then work with the failure group as one remediation scope.</p>
+    <div class="queue-platform-groups cohort-platform-grid">${groups.sort((a, b) => b.accounts.length - a.accounts.length).map(group => {
+      const stats = rotationCohortStats(group.accounts);
+      return `<article class="queue-platform-card"><div class="queue-platform-head"><div><h5>${escapeHtml(group.platform.platform_id)}</h5><p>${group.accounts.length} account${group.accounts.length === 1 ? "" : "s"} · ${Math.round(group.accounts.length / Math.max(group.platform.total_accounts, 1) * 100)}% of visible platform accounts</p></div><span class="cohort-volume">${group.accounts.length}</span></div><div class="cohort-stat-line"><span>${stats.disabled} management disabled</span><span>${stats.oldest == null ? "Age unavailable" : `Oldest ${stats.oldest} days`}</span><span>${stats.failed} failed status</span></div><p>${escapeHtml(stats.commonEvidence || "No common error detail was returned for this group.")}</p><button type="button" class="ghost rotation-select-platform" data-platform-index="${group.index}" data-cohort="${escapeAttr(queue.label)}">Open platform groups</button></article>`;
+    }).join("")}</div></section>`;
+}
+
+function rotationCohortStats(accounts) {
+  const unique = [...new Map(accounts.map(account => [account.account_id, account])).values()];
+  const ages = unique.map(account => account.authoritative_age_days ?? account.reported_age_days).filter(Number.isFinite);
+  const evidence = new Map();
+  unique.forEach(account => {
+    const detail = String(account.cpm_error_detail || account.detail || "").trim();
+    if (detail) evidence.set(detail, (evidence.get(detail) || 0) + 1);
+  });
+  const common = [...evidence.entries()].sort((a, b) => b[1] - a[1])[0];
+  return {count: unique.length, disabled: unique.filter(account => account.automatic_management_enabled === false).length,
+    failed: unique.filter(account => String(account.cpm_status || account.status).toLowerCase() === "failure").length,
+    oldest: ages.length ? Math.max(...ages) : null, newest: ages.length ? Math.min(...ages) : null,
+    commonEvidence: common ? `${common[1]} account${common[1] === 1 ? "" : "s"}: ${common[0]}` : ""};
+}
+
+function renderRotationCompactAccounts(accounts) {
+  return `<div class="compact-account-list">${accounts.map(account => {
+    const age = account.authoritative_age_days ?? account.reported_age_days;
+    const source = account.authoritative_change_time ? "Last successful change" : "Reported management activity";
+    const disablement = account.change_disabled_reason || account.reconcile_disabled_reason || account.verify_disabled_reason;
+    return `<article><div><strong>${escapeHtml(account.name || account.username || "Unnamed account")}</strong><small>${escapeHtml(account.safe_name)} · ${escapeHtml(account.username)} @ ${escapeHtml(account.address)}</small></div><div><span>${age == null ? "Age unknown" : `${age} days`}</span><small>${escapeHtml(source)} · ${account.automatic_management_enabled === false ? "Management disabled" : escapeHtml(account.cpm_status || account.status || "Status unavailable")}</small></div><details><summary>Evidence</summary><p>${escapeHtml(account.cpm_error_detail || account.detail || "No additional detail returned")}</p>${disablement ? `<small>Action disabled: ${escapeHtml(disablement)}</small>` : ""}<small>${escapeHtml((account.issues || []).join(" · "))}</small></details></article>`;
+  }).join("")}</div>`;
+}
+
+function renderRotationCohortFocus(category, platformIndex) {
+  if (!category) return "";
+  const stats = rotationCohortStats(category.accounts);
+  const bucket = rotationIssueBucket(category.label);
+  const showAccounts = state.telemetry.rotationShowCohortAccounts;
+  const visibleAccounts = category.accounts.slice(0, 50);
+  return `<section class="cohort-focus"><div class="cohort-focus-head"><div><span class="priority-rank p${bucket.priority}">${bucket.priority === 1 ? "Start first" : bucket.priority === 2 ? "Work next" : "Investigate"}</span><h4>${escapeHtml(category.label)}</h4><p>${escapeHtml(bucket.next_step)}</p></div><div class="workspace-count"><strong>${stats.count}</strong><span>accounts</span></div></div>
+    <div class="cohort-summary-metrics"><div><strong>${stats.disabled}</strong><span>Management disabled</span></div><div><strong>${stats.failed}</strong><span>Failed status</span></div><div><strong>${stats.oldest ?? "—"}</strong><span>${stats.oldest == null ? "Age unavailable" : "Oldest age in days"}</span></div><div><strong>${stats.newest ?? "—"}</strong><span>${stats.newest == null ? "Age unavailable" : "Newest age in days"}</span></div></div>
+    <div class="cohort-common-evidence"><strong>Most common returned evidence</strong><p>${escapeHtml(stats.commonEvidence || "CyberArk did not return a repeated error detail for this group.")}</p></div>
+    <div class="cohort-focus-actions"><button type="button" class="rotation-use-cohort" data-platform-index="${platformIndex}" data-cohort="${escapeAttr(category.label)}">Prepare an action for this group</button><button type="button" class="ghost rotation-toggle-cohort-accounts">${showAccounts ? "Hide account sample" : "View account sample"}</button></div>
+    ${showAccounts ? `<div class="cohort-account-sample"><p>Showing ${visibleAccounts.length} of ${stats.count} accounts. Export CSV for the complete inventory.</p>${renderRotationCompactAccounts(visibleAccounts)}</div>` : '<p class="cohort-hidden-note">Account identities stay hidden until needed. The group count and shared evidence above are enough to choose a remediation path.</p>'}
+  </section>`;
+}
+
+function renderRotationPlatformDetail(platform, index) {
+  if (!platform) return '<div class="rotation-workspace-empty"><h4>No platform selected</h4></div>';
+  const labels = new Set(platform.categories.map(category => category.label));
+  if (!labels.has(state.telemetry.rotationSelectedCohort)) state.telemetry.rotationSelectedCohort = platform.categories[0]?.label || "";
+  const selected = platform.categories.find(category => category.label === state.telemetry.rotationSelectedCohort);
+  return `<section class="rotation-workspace-detail"><div class="workspace-detail-head"><div><span class="priority-rank">Platform workspace</span><h4>${escapeHtml(platform.platform_id)}</h4><p>${platform.affected_accounts} of ${platform.total_accounts} visible accounts have findings · oldest reported age ${platform.oldest_reported_age_days ?? "unknown"}${platform.oldest_reported_age_days == null ? "" : " days"}</p></div></div>
+    <section class="platform-cohort-overview"><div class="section-intro"><div><h4>Failure groups</h4><p>Choose one group to see its shared evidence and remediation path. Accounts can belong to more than one group.</p></div><span>${platform.categories.length} groups</span></div><div class="platform-cohort-grid">${platform.categories.map(category => { const bucket = rotationIssueBucket(category.label); return `<button type="button" class="rotation-select-cohort ${category.label === state.telemetry.rotationSelectedCohort ? "active" : ""}" data-cohort="${escapeAttr(category.label)}"><span class="priority-rank p${bucket.priority}">${bucket.priority === 1 ? "First" : bucket.priority === 2 ? "Next" : "Review"}</span><strong>${escapeHtml(category.label)}</strong><small>${category.accounts.length} account${category.accounts.length === 1 ? "" : "s"}</small></button>`; }).join("")}</div></section>
+    ${renderRotationCohortFocus(selected, index)}
+    <details class="platform-advisory"><summary>Platform configuration and recommendations</summary><div class="platform-detail-section">${renderRotationRecommendations(platform)}</div></details>
+    ${renderRotationPlatformActions(platform, index)}
+    </section>`;
+}
+
+function renderRotationWorkspace(report) {
+  const insights = buildRotationInsights(report);
+  const queueLabels = new Set(insights.work_queues.map(queue => queue.label));
+  if (!queueLabels.has(state.telemetry.rotationSelectedQueue)) state.telemetry.rotationSelectedQueue = insights.work_queues[0]?.label || "";
+  const mode = state.telemetry.rotationWorkspaceMode === "platforms" ? "platforms" : "queues";
+  const selectedQueue = insights.work_queues.find(queue => queue.label === state.telemetry.rotationSelectedQueue);
+  const selectedIndex = Number.isInteger(state.telemetry.rotationSelectedPlatform) && report.platforms[state.telemetry.rotationSelectedPlatform] ? state.telemetry.rotationSelectedPlatform : insights.platforms[0]?.index || 0;
+  state.telemetry.rotationSelectedPlatform = selectedIndex;
+  return `<section class="rotation-workspace"><div class="rotation-workspace-bar"><div><span class="eyebrow">Investigation workspace</span><h4>Choose a queue or platform</h4></div><div class="workspace-mode" role="tablist" aria-label="Workspace navigation"><button type="button" role="tab" class="rotation-workspace-mode ${mode === "queues" ? "active" : ""}" data-mode="queues" aria-selected="${mode === "queues"}">Work queues</button><button type="button" role="tab" class="rotation-workspace-mode ${mode === "platforms" ? "active" : ""}" data-mode="platforms" aria-selected="${mode === "platforms"}">Platforms</button></div></div>
+    <div class="rotation-workspace-layout"><aside><label class="workspace-search">Filter ${mode === "queues" ? "work queues" : "platforms"}<input type="search" id="rotation-workspace-search" placeholder="Type to filter"></label><nav class="workspace-nav" aria-label="${mode === "queues" ? "Work queues" : "Platforms"}">${mode === "queues" ? insights.work_queues.map(queue => `<button type="button" class="rotation-select-queue ${queue.label === state.telemetry.rotationSelectedQueue ? "active" : ""}" data-queue="${escapeAttr(queue.label)}" data-search-text="${escapeAttr(`${queue.label} ${queue.next_step}`.toLowerCase())}"><span class="priority-rank p${queue.priority}">${queue.priority === 1 ? "First" : queue.priority === 2 ? "Next" : "Review"}</span><strong>${escapeHtml(queue.label)}</strong><small>${queue.account_count} accounts · ${queue.platform_count} platforms</small></button>`).join("") : insights.platforms.map(row => `<button type="button" class="rotation-select-platform ${row.index === selectedIndex ? "active" : ""}" data-platform-index="${row.index}" data-search-text="${escapeAttr(`${row.platform_id} ${row.dominant_issue}`.toLowerCase())}"><span class="priority-rank p${row.tier}">${row.priority_label}</span><strong>${escapeHtml(row.platform_id)}</strong><small>${row.affected} affected · ${escapeHtml(row.dominant_issue)}</small></button>`).join("")}</nav><p id="rotation-workspace-search-status" class="workspace-search-status"></p></aside><main>${mode === "queues" ? renderRotationQueueDetail(report, selectedQueue) : renderRotationPlatformDetail(report.platforms[selectedIndex], selectedIndex)}</main></div></section>`;
+}
+
 function renderRotationHealthDashboard() {
   const report = currentRotationReport();
   return `<section class="card telemetry-dashboard-panel rotation-health">
@@ -3175,24 +3296,9 @@ function renderRotationHealthDashboard() {
     ${state.telemetry.rotationActionBusy ? '<p role="status">Working on the administrative request. Current account details are checked individually; large selections may take several minutes.</p>' : ""}
     ${renderRotationActionStatus()}
     ${report ? `<p>${escapeHtml(report.tenant_name)} · ${escapeHtml(formatTelemetryTimestamp(report.generated_at))} · Threshold: ${report.threshold_days} days</p>
-      <div class="telemetry-metrics">
-        <div class="context-pill"><span>Visible accounts scanned</span><strong>${report.total_accounts}</strong></div>
-        <div class="context-pill"><span>Unique accounts with findings</span><strong>${report.affected_accounts}</strong></div>
-        <div class="context-pill"><span>Platforms requiring review</span><strong>${report.platforms.length}</strong></div>
-        <div class="context-pill"><span>Inventory pagination</span><strong>${report.inventory_complete ? "Complete for visible scope" : "Incomplete"}</strong></div>
-      </div>
-      <details class="rotation-notes" open><summary>Evidence and coverage limitations</summary><ul>${report.warnings.map(w => `<li>${escapeHtml(w)}</li>`).join("")}</ul><p>Category totals overlap. Platform totals count accounts once. Accounts outside these groups have no matching findings in the returned metadata; successful rotation is not confirmed.</p></details>
-      ${report.platforms.length ? report.platforms.map((platform, platformIndex) => `<details class="rotation-platform">
-        <summary>${escapeHtml(platform.platform_id)} — ${platform.affected_accounts} / ${platform.total_accounts} visible accounts with findings · Oldest reported age: ${platform.oldest_reported_age_days ?? "unknown"}${platform.oldest_reported_age_days == null ? "" : " days"}</summary>
-        <div class="rotation-platform-body">${renderRotationRecommendations(platform)}${renderRotationPlatformActions(platform, platformIndex)}
-        ${platform.categories.map(category => `<details class="rotation-category"><summary>${escapeHtml(category.label)} (${category.accounts.length})</summary>
-          <div class="rotation-table-scroll"><table class="rotation-table"><thead><tr><th>Account / ID</th><th>Safe / target</th><th>Reported change date / age</th><th>Management</th><th>Issues / original detail</th></tr></thead><tbody>
-          ${category.accounts.map(a => `<tr><td>${escapeHtml(a.name || a.username || "Unnamed")}<small>${escapeHtml(a.account_id)}</small></td>
-            <td>${escapeHtml(a.safe_name)}<small>${escapeHtml(a.username)} @ ${escapeHtml(a.address)}</small></td>
-            <td>${a.reported_change_time ? escapeHtml(formatTelemetryTimestamp(a.reported_change_time)) : "Unknown"}<small>${a.reported_age_days == null ? "Unknown age" : `${a.reported_age_days} days`} · target rotation unconfirmed</small></td>
-            <td>${a.automatic_management_enabled == null ? "Unknown" : a.automatic_management_enabled ? "Automatic" : "Disabled"}<small>${escapeHtml(a.status || "Status unavailable")}</small></td>
-            <td>${escapeHtml(a.issues.join("; "))}<small>${escapeHtml(a.detail || "No additional detail returned")}</small></td></tr>`).join("")}
-          </tbody></table></div></details>`).join("")}</div></details>`).join("") : "<p>No matching account or confirmed platform findings were returned. Review coverage limitations before drawing conclusions.</p>"}`
+      ${renderRotationCommandCenter(report)}
+      ${report.platforms.length ? renderRotationWorkspace(report) : "<p>No matching account or confirmed platform findings were returned. Review coverage limitations before drawing conclusions.</p>"}
+      <details class="rotation-notes"><summary>Evidence, coverage, and interpretation</summary><ul>${report.warnings.map(w => `<li>${escapeHtml(w)}</li>`).join("")}</ul><p>Priority counts are unique by highest urgency. Work-queue totals can overlap when an account has several issues. Platform totals count accounts once. Reported dates do not prove successful target rotation.</p></details>`
       : "<p>Scan the active tenant to inspect visible accounts and platform configuration. Passwords are never retrieved. Reported dates do not prove a successful target rotation; no effective policy interval is assumed.</p>"}
   </section>`;
 }
@@ -3208,6 +3314,12 @@ async function refreshRotationHealth(event) {
   state.telemetry.rotationHealth = null;
   state.telemetry.rotationAction = null;
   state.telemetry.rotationRecovery = null;
+  state.telemetry.rotationWorkspaceMode = "queues";
+  state.telemetry.rotationSelectedQueue = "";
+  state.telemetry.rotationSelectedPlatform = 0;
+  state.telemetry.rotationSelectedCohort = "";
+  state.telemetry.rotationShowCohortAccounts = false;
+  state.telemetry.rotationActionCohort = "";
   const tenantId = state.snapshot.active_tenant_id;
   const profileId = state.snapshot.active_profile_id;
   render();
@@ -3230,7 +3342,7 @@ async function refreshRotationHealth(event) {
 function exportRotationHealth() {
   const report = currentRotationReport();
   if (!report) return;
-  const rows = [["record_type", "tenant", "generated_at", "threshold_days", "inventory_complete", "platform", "account_id", "account_name", "safe", "username", "address", "reported_change_time", "reported_age_days", "automatic_management_enabled", "status", "issues", "evidence"]];
+  const rows = [["record_type", "tenant", "generated_at", "threshold_days", "inventory_complete", "platform", "account_id", "account_name", "safe", "username", "address", "last_successful_change", "authoritative_age_days", "reported_management_time", "reported_age_days", "policy_interval_days", "next_change_schedule", "automatic_management_enabled", "cpm_status", "action_disabled_reason", "issues", "evidence"]];
   // Neutralize spreadsheet formulas in any tenant-controlled field.
   const cell = value => typeof value === "string" && /^[\s]*[=+@-]/.test(value) ? `'${value}` : value;
   const context = [report.tenant_name, report.generated_at, report.threshold_days, report.inventory_complete];
@@ -3238,7 +3350,7 @@ function exportRotationHealth() {
   for (const platform of report.platforms) {
     for (const f of platform.findings) rows.push(["platform_finding", ...context, platform.platform_id, "", "", "", "", "", "", "", "", "", `${f.level}: ${f.title}`, f.evidence]);
     const accounts = new Map(platform.categories.flatMap(c => c.accounts.map(a => [a.account_id, a])));
-    for (const a of accounts.values()) rows.push(["account", ...context, platform.platform_id, a.account_id, a.name, a.safe_name, a.username, a.address, a.reported_change_time, a.reported_age_days, a.automatic_management_enabled, a.status, a.issues.join("; "), `${a.age_evidence}; ${a.detail}`]);
+    for (const a of accounts.values()) rows.push(["account", ...context, platform.platform_id, a.account_id, a.name, a.safe_name, a.username, a.address, a.authoritative_change_time, a.authoritative_age_days, a.reported_change_time, a.reported_age_days, a.policy_interval_days, a.next_change_schedule, a.automatic_management_enabled, a.cpm_status || a.status, a.change_disabled_reason || a.reconcile_disabled_reason || a.verify_disabled_reason, a.issues.join("; "), `${a.authoritative_change_time ? "CyberArk compliance last-success timestamp" : a.age_evidence}; ${a.cpm_error_detail || a.detail}`]);
   }
   saveDownload(toCsv(rows.map(row => row.map(cell))), "text/csv;charset=utf-8", "fastpas-rotation-health.csv", "csv").catch(error => { log(formatError(error)); render(); });
 }
@@ -3924,6 +4036,63 @@ function renderDebugPage() {
 }
 
 function wireEvents() {
+  document.querySelectorAll(".rotation-workspace-mode").forEach(button => button.addEventListener("click", () => {
+    state.telemetry.rotationWorkspaceMode = button.dataset.mode;
+    render();
+  }));
+  document.querySelectorAll(".rotation-select-queue, .rotation-quick-queue").forEach(button => button.addEventListener("click", () => {
+    state.telemetry.rotationWorkspaceMode = "queues";
+    state.telemetry.rotationSelectedQueue = button.dataset.queue;
+    render();
+    document.querySelector(".rotation-workspace")?.scrollIntoView({behavior: "smooth", block: "start"});
+  }));
+  document.querySelectorAll(".rotation-select-platform").forEach(button => button.addEventListener("click", () => {
+    state.telemetry.rotationWorkspaceMode = "platforms";
+    state.telemetry.rotationSelectedPlatform = Number(button.dataset.platformIndex);
+    const platform = currentRotationReport()?.platforms[state.telemetry.rotationSelectedPlatform];
+    if (button.dataset.cohort && platform) {
+      state.telemetry.rotationSelectedCohort = platform.categories.find(category => rotationIssueBucket(category.label).label === button.dataset.cohort)?.label || "";
+    } else {
+      state.telemetry.rotationSelectedCohort = "";
+    }
+    state.telemetry.rotationShowCohortAccounts = false;
+    render();
+    document.querySelector(".rotation-workspace")?.scrollIntoView({behavior: "smooth", block: "start"});
+  }));
+  document.querySelectorAll(".rotation-select-cohort").forEach(button => button.addEventListener("click", () => {
+    state.telemetry.rotationSelectedCohort = button.dataset.cohort;
+    state.telemetry.rotationShowCohortAccounts = false;
+    render();
+  }));
+  document.querySelectorAll(".rotation-toggle-cohort-accounts").forEach(button => button.addEventListener("click", () => {
+    state.telemetry.rotationShowCohortAccounts = !state.telemetry.rotationShowCohortAccounts;
+    render();
+  }));
+  document.querySelectorAll(".rotation-use-cohort").forEach(button => button.addEventListener("click", () => {
+    state.telemetry.rotationSelectedPlatform = Number(button.dataset.platformIndex);
+    state.telemetry.rotationActionCohort = button.dataset.cohort;
+    render();
+    const actions = document.querySelector(".rotation-actions");
+    if (actions) { actions.open = true; actions.scrollIntoView({behavior: "smooth", block: "start"}); }
+  }));
+  bind("#rotation-workspace-search", "input", event => {
+    const query = event.currentTarget.value.trim().toLowerCase();
+    let visible = 0;
+    document.querySelectorAll(".workspace-nav > button").forEach(button => {
+      button.hidden = Boolean(query) && !button.dataset.searchText.includes(query);
+      if (!button.hidden) visible += 1;
+    });
+    const status = document.querySelector("#rotation-workspace-search-status");
+    if (status) status.textContent = query ? `${visible} matching option${visible === 1 ? "" : "s"}` : "";
+  });
+  document.querySelectorAll(".rotation-open-platform").forEach(button => button.addEventListener("click", () => {
+    const platform = document.querySelector(`#rotation-platform-${button.dataset.platformIndex}`);
+    if (!platform) return;
+    const library = platform.closest(".rotation-detail-library");
+    if (library) library.open = true;
+    platform.open = true;
+    platform.scrollIntoView({behavior: "smooth", block: "start"});
+  }));
   document.querySelectorAll(".rotation-action-form").forEach(form => form.addEventListener("submit", prepareRotationAction));
   document.querySelectorAll(".rotation-select").forEach(button => button.addEventListener("click", () => {
     button.closest("form").querySelectorAll('input[name="account_id"]').forEach(box => { box.checked = button.dataset.selection === "all" || box.dataset.management === button.dataset.selection; });

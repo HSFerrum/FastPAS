@@ -867,6 +867,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "chrono",
+ "futures-util",
  "keyring",
  "reqwest 0.12.28",
  "serde",

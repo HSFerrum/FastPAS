@@ -1,11 +1,79 @@
 const escape = value => String(value ?? "").replace(/[&<>"']/g, char => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[char]));
 const number = value => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
 const date = value => value && !Number.isNaN(Date.parse(value)) ? new Date(value).toLocaleString("en-US", {timeZone: "UTC", dateStyle: "medium", timeStyle: "short"}) + " UTC" : "Not available";
-const settingNames = {
-  PerformPeriodicChange: "Scheduled password changes", PerformChangeTask: "Password change processing",
-  PerformPeriodicVerification: "Scheduled password verification", PerformVerifyTask: "Password verification processing",
-  AutomaticReconcileWhenUnsynched: "Automatic recovery of out-of-sync credentials", PerformReconcileTask: "Password reconciliation processing"
-};
+const issueBuckets = [
+  [/Automatic management disabled/i, "Automatic management disabled", 1, "Restore management for approved accounts after reviewing the disablement reasons."],
+  [/Account not managed by CPM/i, "Accounts outside CPM management", 1, "Confirm the account should be CPM-managed, then restore management after resolving its disablement reason."],
+  [/Assigned platform unavailable/i, "Assigned platform is unavailable", 1, "Assign an active, supported platform before attempting another management operation."],
+  [/Password change action disabled/i, "Password changes disabled for affected accounts", 1, "Review the returned disablement reason and effective policy before enabling password changes."],
+  [/Reconciliation action disabled/i, "Reconciliation disabled for failed accounts", 1, "Resolve the returned disablement reason and recovery-account requirements before another reconciliation."],
+  [/authentication failure/i, "Credentials rejected by the target", 1, "Validate the stored or recovery credential and the target authentication path."],
+  [/permission failure/i, "Insufficient target permissions", 1, "Correct the CPM or recovery identity permissions before retrying management."],
+  [/connectivity failure/i, "Target connectivity failures", 1, "Restore name resolution, network access, and target service availability."],
+  [/password-policy rejection/i, "Target password-policy rejection", 1, "Align the generated credential with the target password requirements."],
+  [/dependency failure/i, "Dependent-account failures", 1, "Resolve the dependent account workflow and retry after the primary credential is healthy."],
+  [/Platform policy failure/i, "Platform policy failures", 1, "Review the platform policy and the account's applicable policy exceptions."],
+  [/Reconcile failed/i, "Reconciliation failures", 1, "Validate the recovery-account association, safe access, and target reset permissions."],
+  [/Change failed/i, "Password-change failures", 1, "Review the original change error, target access, and password requirements."],
+  [/Management failed/i, "Unclassified management failures", 1, "Use CyberArk activity history to identify the failed operation and original cause."],
+  [/Verification failed/i, "Verification failures", 2, "Determine whether the stored credential matches the target before requesting another change."],
+  [/Verification action disabled/i, "Verification disabled for failed accounts", 2, "Review the returned disablement reason before relying on verification for these accounts."],
+  [/Last successful change exceeds threshold/i, "Credentials past the successful-change threshold", 2, "Address the oldest accounts first using the last successful change reported by CyberArk compliance data."],
+  [/Reported age exceeds threshold/i, "Credentials above the reported-age threshold", 2, "Confirm authoritative rotation history, then address the oldest eligible credentials first."],
+  [/No management activity timestamp above threshold/i, "Old accounts without management activity", 2, "Confirm whether these accounts have ever been managed, then validate their policy eligibility and activity history."]
+];
+
+function insightAccountKey(account, platformId) { return `${platformId || account.platform_id || ""}/${account.account_id || account.name || "unknown"}`; }
+
+export function rotationIssueBucket(issue) {
+  const match = issueBuckets.find(([pattern]) => pattern.test(issue || ""));
+  return match ? {label: match[1], priority: match[2], next_step: match[3]} : {label: issue || "Other finding", priority: 3, next_step: "Review the original evidence before selecting a remediation."};
+}
+
+export function buildRotationInsights(report = {}) {
+  const queues = new Map();
+  const uniqueAccounts = new Map();
+  const platformRows = [];
+  for (const [index, platform] of (report.platforms || []).entries()) {
+    const accounts = platform.accounts || [...new Map((platform.categories || []).flatMap(category => category.accounts.map(account => [account.account_id, account]))).values()];
+    const platformQueue = new Map();
+    const platformPriorities = new Map();
+    for (const account of accounts) {
+      const key = insightAccountKey(account, platform.platform_id);
+      const issues = account.issues || [];
+      let highest = 4;
+      const specificFailure = issues.some(issue => /^Reported (authentication|permission|connectivity|password-policy|dependency)/i.test(issue));
+      for (const issue of issues) {
+        if (specificFailure && /^(Change|Reconcile|Verification) failed$/i.test(issue)) continue;
+        const bucket = rotationIssueBucket(issue);
+        highest = Math.min(highest, bucket.priority);
+        const global = queues.get(bucket.label) || {label: bucket.label, priority: bucket.priority, next_step: bucket.next_step, accounts: new Map(), platforms: new Set()};
+        global.accounts.set(key, account); global.platforms.add(platform.platform_id); queues.set(bucket.label, global);
+        const local = platformQueue.get(bucket.label) || {label: bucket.label, priority: bucket.priority, count: 0, keys: new Set()};
+        local.keys.add(key); local.count = local.keys.size; platformQueue.set(bucket.label, local);
+      }
+      if (highest < 4) {
+        uniqueAccounts.set(key, Math.min(uniqueAccounts.get(key) || 4, highest));
+        platformPriorities.set(key, Math.min(platformPriorities.get(key) || 4, highest));
+      }
+    }
+    const blockers = (platform.findings || []).filter(finding => finding.level === "Confirmed setting" && !/verification/i.test(finding.title || "")).length;
+    const ordered = [...platformQueue.values()].sort((a, b) => a.priority - b.priority || b.count - a.count || a.label.localeCompare(b.label));
+    const immediate = new Set(); const watch = new Set(); const investigate = new Set();
+    for (const [key, priority] of platformPriorities) (priority === 1 ? immediate : priority === 2 ? watch : investigate).add(key);
+    const tier = blockers || immediate.size ? 1 : watch.size ? 2 : 3;
+    platformRows.push({index, platform_id: platform.platform_id, tier, priority_label: tier === 1 ? "Start first" : tier === 2 ? "Next" : "Review", immediate: immediate.size,
+      watch: watch.size, investigate: investigate.size, blockers, affected: platform.affected_accounts || 0, total: platform.total_accounts || accounts.length,
+      dominant_issue: ordered[0]?.label || (blockers ? "Platform configuration blockers" : "Further review"),
+      next_step: ordered[0] ? (queues.get(ordered[0].label)?.next_step || "Review the platform evidence.") : blockers ? "Review the confirmed platform settings before retrying account operations." : "Review missing evidence and policy applicability.",
+      score: blockers * 20 + immediate.size * 6 + watch.size * 3 + investigate.size});
+  }
+  platformRows.sort((a, b) => a.tier - b.tier || b.score - a.score || b.affected - a.affected || a.platform_id.localeCompare(b.platform_id));
+  const workQueues = [...queues.values()].map(queue => ({label: queue.label, priority: queue.priority, next_step: queue.next_step, account_count: queue.accounts.size, platform_count: queue.platforms.size,
+    first_platform_index: platformRows.find(row => queue.platforms.has(row.platform_id))?.index ?? 0})).sort((a, b) => a.priority - b.priority || b.account_count - a.account_count || a.label.localeCompare(b.label));
+  return {immediate_accounts: [...uniqueAccounts.values()].filter(value => value === 1).length, watch_accounts: [...uniqueAccounts.values()].filter(value => value === 2).length,
+    investigate_accounts: [...uniqueAccounts.values()].filter(value => value === 3).length, work_queues: workQueues, platforms: platformRows};
+}
 
 export function describeRotationFinding(finding) {
   const title = finding.title || "Platform review";
@@ -25,28 +93,14 @@ export function describeRotationFinding(finding) {
     "Platform configuration could not be inspected": ["Platform configuration was unavailable", "The scan could not retrieve the platform configuration. Its settings cannot be assessed from this report.", "Check the scanning identity’s permissions and the tenant’s API support, then rerun the scan. Do not interpret unavailable settings as healthy or faulty."]
   };
   let description = descriptions[title];
-  if (title.endsWith(" not exposed")) {
-    const key = title.slice(0, -12);
-    description = [`${settingNames[key] || key} could not be inspected`, "The API response did not include this setting, so its state is unknown.", "Review the setting in CyberArk or use an authorized configuration source before deciding whether a change is needed."];
-  }
-  if (title === "Schedule or credential configuration") {
-    const match = evidence.match(/\/([^/\s]+)\s*=\s*(.*?)\. Review effective policy/);
-    const key = match?.[1];
-    let value = match?.[2] || "not available";
-    try { value = JSON.parse(value); } catch { /* Keep the observed value. */ }
-    const labels = {FromHour: "Rotation window start", ToHour: "Rotation window end", ExecutionDays: "Allowed rotation days", ReconcileAccountSafe: "Recovery-account safe", ReconcileAccountName: "Recovery-account name", ReconcileAccountFolder: "Recovery-account folder", PasswordChangeInterval: "Configured rotation interval", MinValidityPeriod: "Configured credential validity period"};
-    if (key === "FromHour" || key === "ToHour") value = Number(value) === -1 ? "no explicit hour restriction" : `${String(value).padStart(2, "0")}:00 (component schedule)`;
-    description = [labels[key] || "Scheduling or recovery configuration", `The returned ${key?.includes("Reconcile") ? "recovery-account configuration" : "schedule configuration"} specifies: ${value === "" ? "no value" : value}. This is an observed setting, not an established cause of failure.`, key?.includes("Reconcile") ? "Verify the effective account association, safe access, and recovery identity permissions. Account-level settings may override the platform default." : "Compare the execution schedule with the effective policy and component polling schedule. Confirm that eligible accounts have a usable maintenance window."];
-  }
   description ||= [title, evidence, "Review this finding with the platform owner and confirm its relevance to the affected accounts before making changes."];
   return {level, title: description[0], summary: description[1], recommendation: description[2], technical: evidence};
 }
 
 export function presentRotationFindings(findings = []) {
-  const missing = findings.filter(f => f.title?.endsWith(" not exposed"));
-  const presented = findings.filter(f => !missing.includes(f)).map(describeRotationFinding);
-  if (missing.length) presented.push({level: "Inspection gap", title: "Some platform settings could not be inspected", summary: `${missing.length} management ${missing.length === 1 ? "setting was" : "settings were"} not included in the platform response. Missing information is not evidence that these features are disabled.`, recommendation: "Review the unavailable settings in CyberArk before assessing the platform’s configuration.", technical: missing.map(f => `${f.title}: ${f.evidence}`).join("\n")});
-  return presented;
+  return findings
+    .filter(f => !f.title?.endsWith(" not exposed") && f.title !== "Schedule or credential configuration" && f.title !== "Effective policy and linked credentials require further inspection")
+    .map(describeRotationFinding);
 }
 
 function categoryAdvice(label) {
@@ -55,9 +109,15 @@ function categoryAdvice(label) {
     "Reconcile failed": "Review the recovery-account association, its safe access and target permissions, and the original reconciliation error.",
     "Verification failed": "Check whether the stored credential matches the target. Review authentication and connectivity errors; verification alone does not rotate a secret.",
     "Automatic management disabled": "Review each disablement reason and approved exception. Restore automatic management only after the reason for disabling it has been addressed.",
+    "Account not managed by CPM": "Confirm the account belongs in the CPM workflow and review the returned disablement reason before restoring management.",
+    "Assigned platform unavailable": "Assign an active platform that supports the account before retrying management.",
+    "Password change action disabled": "Review the effective action state and its returned disablement reason before enabling change processing.",
+    "Reconciliation action disabled": "Review the effective reconcile state, recovery account, and returned disablement reason before retrying.",
+    "Verification action disabled": "Review the effective verification state and its returned disablement reason before retrying.",
     "Reported age exceeds threshold": "Confirm the last successful target change against authoritative activity records. Review the effective rotation interval and scheduling before treating reported metadata age as a compliance failure.",
-    "Rotation history unavailable": "Obtain authoritative rotation history or correct the missing date data. An unknown date cannot establish whether the account is overdue.",
-    "Management setting unknown": "Inspect the account’s automatic-management setting using an identity with the required visibility.",
+    "Last successful change exceeds threshold": "Use the CyberArk compliance timestamp to prioritize the oldest eligible accounts, then resolve any accompanying blockers before requesting a change.",
+    "No management activity timestamp above threshold": "Confirm whether the account has ever been managed, then inspect policy eligibility and authoritative activity history.",
+    "Platform policy failure": "Review the platform policy and the account's applicable policy exceptions before retrying management.",
     "Management failed — operation unknown": "Review the account’s activity history to identify the failed operation and original error before choosing a recovery action."
   };
   return advice[label] || "Review the original error and validate the relevant connectivity, access, or platform requirements before attempting recovery.";
@@ -66,17 +126,18 @@ function categoryAdvice(label) {
 export function groupRotationRecommendations(platform) {
   const groups = {core: [], additional: [], inspection: []};
   for (const finding of presentRotationFindings(platform.findings || [])) {
-    if (finding.level === "Account pattern" && (platform.categories || []).some(c => c.label === "Automatic management disabled")) continue;
-    const core = finding.level === "Account pattern" || finding.level === "Configuration finding" && !/verif/i.test(finding.title);
+    if (finding.level === "Account pattern" && (platform.categories || []).some(c => c.label.startsWith("Automatic management disabled"))) continue;
+    const core = finding.level === "Account pattern" || finding.title.includes("recovery credential") || finding.level === "Configuration finding" && !/verif/i.test(finding.title);
     groups[finding.level === "Inspection gap" ? "inspection" : core ? "core" : "additional"].push(finding);
   }
   for (const category of platform.categories || []) {
+    const bucket = rotationIssueBucket(category.label);
     const isFailure = /failed|failure|rejection/i.test(category.label);
-    const disabled = category.label === "Automatic management disabled";
-    const group = disabled || isFailure ? "core" : "inspection";
-    groups[group].push({level: disabled ? "Confirmed account blocker" : isFailure ? "Observed operation failure" : "Further evidence needed",
+    const confirmedBlocker = bucket.priority === 1 && !isFailure;
+    const group = bucket.priority === 1 ? "core" : bucket.priority === 2 ? "additional" : "inspection";
+    groups[group].push({level: confirmedBlocker ? "Confirmed account blocker" : isFailure ? "Observed operation failure" : bucket.priority === 2 ? "Review next" : "Further evidence needed",
       title: `${category.label} · ${category.accounts.length} account${category.accounts.length === 1 ? "" : "s"}`,
-      summary: disabled ? "These accounts are explicitly excluded from automatic management. Confirm approved exceptions before restoring management." : isFailure ? "CyberArk reports a management failure for these accounts. The original error identifies what must be resolved; the failure alone does not establish a platform-wide cause." : "This account finding requires investigation before a cause or remediation can be established.",
+      summary: confirmedBlocker ? "CyberArk returned an account-level state that can prevent the expected management workflow." : isFailure ? "CyberArk reports a management failure for these accounts. The original error identifies what must be resolved; the failure alone does not establish a platform-wide cause." : "This account finding requires investigation before a cause or remediation can be established.",
       recommendation: categoryAdvice(category.label), technical: "Affected accounts and original details are listed in the corresponding account issue group."});
   }
   return groups;
@@ -93,23 +154,25 @@ function recommendationSections(platform) {
 
 
 function accountTable(accounts) {
-  return `<div class="table-wrap"><table><thead><tr><th>Account</th><th>Safe & target</th><th>Reported credential age</th><th>Management</th><th>Findings & original detail</th></tr></thead><tbody>${accounts.map(a => `<tr data-account><td><b>${escape(a.name || a.username || "Unnamed account")}</b><small>ID ${escape(a.account_id)}</small></td><td>${escape(a.safe_name)}<small>${escape(a.username)} @ ${escape(a.address)}</small></td><td>${a.reported_age_days == null ? "Unknown" : `${number(a.reported_age_days)} days`}<small>${escape(date(a.reported_change_time))}</small><small>Successful target rotation unconfirmed</small></td><td>${a.automatic_management_enabled == null ? "Unknown" : a.automatic_management_enabled ? "Automatic" : "Disabled"}<small>${escape(a.status || "Status unavailable")}</small></td><td>${escape((a.issues || []).join(" · "))}<small>${escape(a.detail || "No additional error details were returned.")}</small></td></tr>`).join("")}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Account</th><th>Safe & target</th><th>Credential age</th><th>Management</th><th>Findings & evidence</th></tr></thead><tbody>${accounts.map(a => `<tr data-account><td><b>${escape(a.name || a.username || "Unnamed account")}</b><small>ID ${escape(a.account_id)}</small></td><td>${escape(a.safe_name)}<small>${escape(a.username)} @ ${escape(a.address)}</small></td><td>${a.authoritative_age_days != null ? `${number(a.authoritative_age_days)} days` : a.reported_age_days == null ? "Unknown" : `${number(a.reported_age_days)} days`}<small>${escape(date(a.authoritative_change_time || a.reported_change_time))}</small><small>${a.authoritative_change_time ? "Last successful change from compliance API" : "Successful target rotation unconfirmed"}</small></td><td>${a.automatic_management_enabled == null ? "Unknown" : a.automatic_management_enabled ? "Automatic" : "Disabled"}<small>${escape(a.cpm_status || a.status || "Status unavailable")}</small>${a.change_disabled_reason ? `<small>Change disabled: ${escape(a.change_disabled_reason)}</small>` : ""}</td><td>${escape((a.issues || []).join(" · "))}<small>${escape(a.cpm_error_detail || a.detail || "No additional error details were returned.")}</small></td></tr>`).join("")}</tbody></table></div>`;
 }
 
 export function buildRotationHealthHtml(report) {
   const platforms = report.platforms || [];
+  const insights = buildRotationInsights(report);
   const categories = platforms.flatMap(p => p.categories || []);
   const unique = label => new Set(categories.filter(c => c.label === label).flatMap(c => c.accounts.map(a => `${a.platform_id || ""}/${a.account_id}`))).size;
-  const metrics = [["Visible accounts scanned", report.total_accounts], ["Accounts with findings", report.affected_accounts], ["Platforms to review", platforms.length], ["Reported age above threshold", unique("Reported age exceeds threshold")], ["Automatic management disabled", unique("Automatic management disabled")], ["History unavailable", unique("Rotation history unavailable")]];
+  const metrics = [["Start first", insights.immediate_accounts], ["Work next", insights.watch_accounts], ["Investigate", insights.investigate_accounts], ["Visible accounts scanned", report.total_accounts], ["Accounts with findings", report.affected_accounts], ["Platforms to review", platforms.length]];
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><title>FastPAS · Rotation Health · ${escape(report.tenant_name)}</title><style>
-  :root{color-scheme:light;--ink:#172b42;--muted:#536477;--line:#dce5ed;--blue:#176386;--soft:#eef5f8}*{box-sizing:border-box}body{margin:0;background:#f3f6f9;color:var(--ink);font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}header{background:#132b42;color:#fff;padding:36px max(24px,calc((100vw - 1320px)/2))}.brand{letter-spacing:.18em;font-size:12px;font-weight:700;color:#8ed6db}h1{font-size:34px;line-height:1.2;margin:12px 0}h2{font-size:24px;margin:0 0 12px}h3{font-size:17px;line-height:1.4;margin:12px 0 8px}p{margin:8px 0}.meta{color:#c7d6e4;font-size:13px}.layout{max-width:1368px;margin:auto;padding:24px}.metrics{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:22px}.metric,.panel{background:#fff;border:1px solid var(--line);border-radius:12px}.metric{padding:18px}.metric span{display:block;color:var(--muted);font-size:12px;line-height:1.4}.metric strong{display:block;font-size:30px;margin-top:8px}.panel{padding:24px;margin:20px 0}.toolbar{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}input{border:1px solid var(--line);border-radius:8px;padding:12px;font:inherit;width:min(480px,100%)}button,.tabs a{font:inherit;color:var(--ink);background:#fff;border:1px solid var(--line);border-radius:8px;padding:10px 15px;cursor:pointer;text-decoration:none}button:hover,.tabs a:hover{background:var(--soft)}button:focus-visible,a:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid #168faf;outline-offset:3px}.tabs{position:sticky;top:0;z-index:20;background:#f3f6f9;display:flex;gap:8px;overflow-x:auto;padding:12px 0;align-items:center;border-bottom:1px solid var(--line)}.report-panel{scroll-margin-top:80px}.tabs a{white-space:nowrap}.tabs a[aria-selected=true]{background:var(--ink);color:white;border-color:var(--ink)}.badge{display:inline-block;background:var(--soft);color:var(--blue);border-radius:30px;font-size:11px;font-weight:700;padding:4px 10px}.amber{background:#fff1d6;color:#80520d}.muted,small{color:var(--muted)}.findings{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.finding{border:1px solid var(--line);border-radius:10px;padding:20px}.finding p{font-size:14px}.action{background:#f5f8fa;border-left:3px solid #2b8b96;padding:12px 14px;margin-top:16px}.action b{font-size:12px;color:var(--blue)}.technical{font-size:12px;margin-top:12px}.technical pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f8fa;padding:12px}summary{cursor:pointer;font-weight:600}.group{border:1px solid var(--line);border-radius:10px;padding:16px;margin-top:14px}.group>summary{font-size:17px}.group>p{color:var(--muted);font-size:14px;margin:12px 0}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;text-align:left;font-size:13px}th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;background:#f5f8fa}td,th{padding:14px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}td{min-width:145px}td small{display:block;font-size:12px;margin-top:4px}.summary-table td:first-child a{color:var(--blue);font-weight:700}.coverage{background:#f8fafc}.coverage li{margin:8px 0}.empty{padding:24px;color:var(--muted)}footer{text-align:center;color:var(--muted);font-size:12px;padding:16px} [hidden]{display:none!important}.print-only{display:none}@media(max-width:1000px){.metrics{grid-template-columns:repeat(3,1fr)}}@media(max-width:640px){.metrics{grid-template-columns:repeat(2,1fr)}.findings{grid-template-columns:1fr}.layout{padding:14px}.panel{padding:18px}h1{font-size:28px}}@media print{body{background:#fff;font-size:11px}header{padding:18px;background:#fff;color:#172b42}.brand,.meta{color:#536477}.layout{padding:0}.toolbar,.tabs,.technical{display:none}.report-panel[hidden]{display:block!important}.panel{break-before:auto;border:0;padding:14px 0}.finding{break-inside:avoid}.metrics{grid-template-columns:repeat(3,1fr)}.table-wrap{overflow:visible}td{min-width:0}a{color:inherit;text-decoration:none}.print-only{display:block}}
+  :root{color-scheme:light;--ink:#172b42;--muted:#536477;--line:#dce5ed;--blue:#176386;--soft:#eef5f8}*{box-sizing:border-box}body{margin:0;background:#f3f6f9;color:var(--ink);font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}header{background:#132b42;color:#fff;padding:36px max(24px,calc((100vw - 1320px)/2))}.brand{letter-spacing:.18em;font-size:12px;font-weight:700;color:#8ed6db}h1{font-size:34px;line-height:1.2;margin:12px 0}h2{font-size:24px;margin:0 0 12px}h3{font-size:17px;line-height:1.4;margin:12px 0 8px}p{margin:8px 0}.meta{color:#c7d6e4;font-size:13px}.layout{max-width:1368px;margin:auto;padding:24px}.metrics{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:22px}.metric,.panel{background:#fff;border:1px solid var(--line);border-radius:12px}.metric{padding:18px}.metric span{display:block;color:var(--muted);font-size:12px;line-height:1.4}.metric strong{display:block;font-size:30px;margin-top:8px}.panel{padding:24px;margin:20px 0}.toolbar{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}input{border:1px solid var(--line);border-radius:8px;padding:12px;font:inherit;width:min(480px,100%)}button,.tabs a{font:inherit;color:var(--ink);background:#fff;border:1px solid var(--line);border-radius:8px;padding:10px 15px;cursor:pointer;text-decoration:none}button:hover,.tabs a:hover{background:var(--soft)}button:focus-visible,a:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid #168faf;outline-offset:3px}.tabs{position:sticky;top:0;z-index:20;background:#f3f6f9;display:flex;gap:8px;overflow-x:auto;padding:12px 0;align-items:center;border-bottom:1px solid var(--line)}.report-panel{scroll-margin-top:80px}.tabs a{white-space:nowrap}.tabs a[aria-selected=true]{background:var(--ink);color:white;border-color:var(--ink)}.badge,.priority{display:inline-block;background:var(--soft);color:var(--blue);border-radius:30px;font-size:11px;font-weight:700;padding:4px 10px}.priority.p1{background:#fbe5df;color:#8d3021}.priority.p2{background:#fbf0d5;color:#7a5311}.priority.p3{background:#e7eef4;color:#425b72}.amber{background:#fff1d6;color:#80520d}.muted,small{color:var(--muted)}.queue-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:18px 0}.queue{padding:15px;border:1px solid var(--line);border-radius:10px}.queue h3{margin:8px 0 2px}.queue small{display:block}.findings{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.finding{border:1px solid var(--line);border-radius:10px;padding:20px}.finding p{font-size:14px}.action{background:#f5f8fa;border-left:3px solid #2b8b96;padding:12px 14px;margin-top:16px}.action b{font-size:12px;color:var(--blue)}.technical{font-size:12px;margin-top:12px}.technical pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f8fa;padding:12px}summary{cursor:pointer;font-weight:600}.group{border:1px solid var(--line);border-radius:10px;padding:16px;margin-top:14px}.group>summary{font-size:17px}.group>p{color:var(--muted);font-size:14px;margin:12px 0}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;text-align:left;font-size:13px}th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;background:#f5f8fa}td,th{padding:14px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}td{min-width:145px}td small{display:block;font-size:12px;margin-top:4px}.summary-table td:first-child a{color:var(--blue);font-weight:700}.coverage{background:#f8fafc}.coverage li{margin:8px 0}.empty{padding:24px;color:var(--muted)}footer{text-align:center;color:var(--muted);font-size:12px;padding:16px} [hidden]{display:none!important}.print-only{display:none}@media(max-width:1000px){.metrics,.queue-grid{grid-template-columns:repeat(3,1fr)}}@media(max-width:640px){.metrics,.queue-grid{grid-template-columns:1fr}.findings{grid-template-columns:1fr}.layout{padding:14px}.panel{padding:18px}h1{font-size:28px}}@media print{body{background:#fff;font-size:11px}header{padding:18px;background:#fff;color:#172b42}.brand,.meta{color:#536477}.layout{padding:0}.toolbar,.tabs,.technical{display:none}.report-panel[hidden]{display:block!important}.panel{break-before:auto;border:0;padding:14px 0}.finding{break-inside:avoid}.metrics{grid-template-columns:repeat(3,1fr)}.table-wrap{overflow:visible}td{min-width:0}a{color:inherit;text-decoration:none}.print-only{display:block}}
   </style></head><body><header><div class="brand">FASTPAS / TELEMETRY</div><h1>Rotation Health</h1><p>Platform configuration, account findings, and recommended next steps.</p><div class="meta">${escape(report.tenant_name || "Tenant")} · Snapshot ${escape(date(report.generated_at))} · Reported-age threshold ${number(report.threshold_days)} days</div></header><main class="layout">
   <div class="metrics">${metrics.map(([label, value]) => `<div class="metric"><span>${escape(label)}</span><strong>${number(value)}</strong></div>`).join("")}</div>
   <div class="toolbar"><label>Find an account <input id="account-search" type="search" placeholder="Search name, safe, username, target or error"></label><button id="print-report" type="button">Print / save as PDF</button></div><p id="search-status" class="muted" role="status" aria-live="polite"></p>
   <nav class="tabs" aria-label="Report sections"><a href="#overview" data-tab="overview">Overview</a>${platforms.map((p, i) => `<a href="#platform-${i}" data-tab="platform-${i}">${escape(p.platform_id)} <span class="badge">${number(p.affected_accounts)}</span></a>`).join("")}</nav>
-  <section id="overview" class="panel report-panel"><h2>Platform overview</h2><p class="muted">Prioritize platforms by their affected account count, then review configuration and account-level evidence. Category totals overlap; account totals are unique within each platform.</p>
-  <div class="table-wrap"><table class="summary-table"><thead><tr><th>Platform</th><th>Visible accounts</th><th>With findings</th><th>Management disabled</th><th>Oldest reported age</th><th>Configuration findings</th></tr></thead><tbody>${platforms.map((p, i) => `<tr><td><a href="#platform-${i}" data-open="platform-${i}">${escape(p.platform_id)}</a></td><td>${number(p.total_accounts)}</td><td>${number(p.affected_accounts)}</td><td>${number(p.disabled_accounts)}</td><td>${p.oldest_reported_age_days == null ? "Unknown" : number(p.oldest_reported_age_days) + " days"}</td><td>${(p.findings || []).filter(f => f.level === "Confirmed setting").length}</td></tr>`).join("")}</tbody></table></div>${platforms.length ? "" : '<p class="empty">No matching account or confirmed platform findings were returned. Review the coverage information before drawing conclusions.</p>'}</section>
-  ${platforms.map((p, i) => `<section id="platform-${i}" class="panel report-panel"><h2>${escape(p.platform_id)}</h2><p class="muted">${number(p.affected_accounts)} of ${number(p.total_accounts)} visible accounts have findings. ${number(p.disabled_accounts)} ${number(p.disabled_accounts) === 1 ? "account has" : "accounts have"} automatic management disabled.</p>${recommendationSections(p)}<h3 style="margin-top:28px">Account issue groups</h3>${(p.categories || []).map(c => `<details class="group" open><summary>${escape(c.label)} <span class="badge">${c.accounts.length} ${c.accounts.length === 1 ? "account" : "accounts"}</span></summary><p>${escape(categoryAdvice(c.label))}</p>${accountTable(c.accounts)}</details>`).join("") || '<p class="empty">No matching account issues were returned for this platform.</p>'}</section>`).join("")}
+  <section id="overview" class="panel report-panel"><h2>Where to start</h2><p class="muted">Address confirmed blockers and reported failures first, then overdue credentials, followed by gaps that need more evidence. Work-queue totals may overlap; urgency metrics assign each account to its highest priority.</p>
+  <div class="queue-grid">${insights.work_queues.slice(0, 6).map(queue => `<article class="queue"><span class="priority p${queue.priority}">${queue.priority === 1 ? "Start first" : queue.priority === 2 ? "Next" : "Investigate"}</span><h3>${escape(queue.label)}</h3><p><b>${queue.account_count}</b> accounts · ${queue.platform_count} platforms</p><small>${escape(queue.next_step)}</small></article>`).join("") || '<p class="empty">No prioritized work queues were returned.</p>'}</div><h2>Platforms ranked by priority</h2>
+  <div class="table-wrap"><table class="summary-table"><thead><tr><th>Priority</th><th>Platform</th><th>First / next</th><th>Primary issue</th><th>Affected</th></tr></thead><tbody>${insights.platforms.map(row => `<tr><td><span class="priority p${row.tier}">${row.priority_label}</span></td><td><a href="#platform-${row.index}" data-open="platform-${row.index}">${escape(row.platform_id)}</a><small>${row.blockers} platform blockers</small></td><td>${row.immediate} / ${row.watch}</td><td>${escape(row.dominant_issue)}<small>${escape(row.next_step)}</small></td><td>${row.affected} of ${row.total}</td></tr>`).join("")}</tbody></table></div>${platforms.length ? "" : '<p class="empty">No matching account or confirmed platform findings were returned. Review the coverage information before drawing conclusions.</p>'}</section>
+  ${platforms.map((p, i) => `<section id="platform-${i}" class="panel report-panel"><h2>${escape(p.platform_id)}</h2><p class="muted">${number(p.affected_accounts)} of ${number(p.total_accounts)} visible accounts have findings. ${number(p.disabled_accounts)} ${number(p.disabled_accounts) === 1 ? "account has" : "accounts have"} automatic management disabled.</p><h3>Failure groups</h3><p class="muted">Groups are collapsed to keep the platform summary compact. Open a group only when individual account evidence is needed.</p>${(p.categories || []).map(c => `<details class="group"><summary>${escape(c.label)} <span class="badge">${c.accounts.length} ${c.accounts.length === 1 ? "account" : "accounts"}</span></summary><p>${escape(categoryAdvice(c.label))}</p>${accountTable(c.accounts)}</details>`).join("") || '<p class="empty">No matching account issues were returned for this platform.</p>'}<details class="group"><summary>Platform configuration and recommendations</summary>${recommendationSections(p)}</details></section>`).join("")}
   <section class="panel coverage"><h2>Scope and evidence</h2><span class="badge ${report.inventory_complete ? "" : "amber"}">${report.inventory_complete ? "Pagination complete for visible accounts" : "Incomplete account inventory"}</span><p>This is a static snapshot of accounts visible to the scanning identity. Reported modification and reconciliation dates are age indicators, not proof of a successful credential change on the target. Verification does not reset credential age.</p><ul>${(report.warnings || []).map(w => `<li>${escape(w)}</li>`).join("")}</ul><p>Configuration findings describe observed settings. Recommendations require review of the intended workflow, effective policy, and account-level overrides. Inspection gaps indicate unavailable information rather than confirmed defects.</p></section></main><footer>FastPAS · Self-contained report · No live connection or external resources required</footer><script>
   (()=>{
     const tabs=[...document.querySelectorAll('[data-tab]')], panels=[...document.querySelectorAll('.report-panel')];
